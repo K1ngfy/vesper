@@ -1,0 +1,49 @@
+{
+  "name": "vesper",
+  "description": "VESPER — 粘贴之前，先过一遍暮星。本地优先的 AI 粘贴脱敏浏览器扩展。",
+  "version": "0.1.0",
+  "type": "module",
+  "license": "MIT",
+  "author": "K1ngfy",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/K1ngfy/vesper.git"
+  },
+  "scripts": {
+    "dev": "wxt",
+    "build": "wxt build",
+    "zip": "wxt zip",
+    "compile": "tsc --noEmit",
+    "lint": "eslint .",
+    "lint:fix": "eslint . --fix",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "e2e": "playwright test",
+    "postinstall": "wxt prepare"
+  },
+  "dependencies": {
+    "react": "^19.2.4",
+    "react-dom": "^19.2.4"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.39.5",
+    "@playwright/test": "^1.64.1",
+    "@tailwindcss/vite": "^4.3.3",
+    "@types/chrome": "^0.3.6",
+    "@types/react": "^19.2.14",
+    "@types/react-dom": "^19.2.3",
+    "@vitest/coverage-v8": "^5.0.5",
+    "@wxt-dev/module-react": "^1.1.5",
+    "eslint": "^9.39.5",
+    "eslint-config-prettier": "^10.1.8",
+    "prettier": "^3.9.10",
+    "tailwindcss": "^4.3.3",
+    "typescript": "^5.9.3",
+    "typescript-eslint": "^8.72.0",
+    "vitest": "^5.0.5",
+    "web-ext": "^10.5.0",
+    "wxt": "^0.21.3"
+  }
+}

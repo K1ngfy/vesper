@@ -1,0 +1,39 @@
+@import 'tailwindcss';
+
+/*
+ * VESPER 极简黑白主题（2026-10-25 重构）
+ * 原"深空蓝 + 星芒橙"品牌色弃用，统一为黑白灰：
+ *   背景 #ffffff · 文本 #111111 · 次级文本 #6b7280 · 边框 #e5e5e5
+ *   主色（按钮/强调）= #111111 黑；星号 ✳ 仍作品牌符号。
+ * 变量名保留，旧组件继续引用但语义已改为黑白。
+ */
+:root {
+  --vesper-bg-1: #ffffff;
+  --vesper-bg-2: #ffffff;
+  --vesper-accent: #111111;
+  --vesper-star-1: #111111;
+  --vesper-star-2: #333333;
+  --vesper-star-3: #555555;
+  --vesper-text: #111111;
+  --vesper-text-dim: #6b7280;
+  --vesper-border: #e5e5e5;
+}
+
+html,
+body {
+  background: var(--vesper-bg-1);
+  color: var(--vesper-text);
+  font-family: -apple-system, 'PingFang SC', 'Microsoft YaHei', sans-serif;
+  min-height: 100vh;
+  margin: 0;
+}
+
+/* 命中高亮：浅灰底 + 黑色字，符合黑白极简 */
+.vesper-mark {
+  background: #f3f4f6;
+  color: #111111;
+  border-radius: 2px;
+  padding: 0 2px;
+  border-bottom: 1px solid #111111;
+  cursor: help;
+}

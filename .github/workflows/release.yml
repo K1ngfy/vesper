@@ -1,0 +1,41 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install
+        run: npm ci
+
+      - name: Build & zip
+        run: |
+          npm run build
+          npm run zip
+
+      - name: Create GitHub Release with zip asset
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          tag="${GITHUB_REF#refs/tags/}"
+          zip=".output/vesper-${tag#v}-chrome.zip"
+          gh release create "$tag" "$zip" \
+            --title "VESPER $tag" \
+            --notes "可下载的分发包（Chrome MV3）：
+          - 解压后在 chrome://extensions 开启开发者模式 → 加载已解压的扩展程序。
+          - Edge 用户同样支持加载已解压扩展。" \
+            --verify-tag
