@@ -1,7 +1,7 @@
 {
   "name": "vesper",
   "description": "VESPER — 粘贴之前，先过一遍暮星。本地优先的 AI 粘贴脱敏浏览器扩展。",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "type": "module",
   "license": "MIT",
   "author": "K1ngfy",

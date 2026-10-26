@@ -13,6 +13,7 @@ import { desensitize } from '../core/engine';
 import { restore } from '../core/restore';
 import type { DesensitizeResult, Hit, Scheme } from '../core/types';
 import { sendMessage } from '../messages';
+import { getMappings, getSettings } from '../storage';
 import { t } from '../i18n';
 // vite 环境类型（vite/client，WXT 已引入）声明了 ?worker 模块导出
 import EngineWorker from '../core/engine.worker?worker';
@@ -33,8 +34,10 @@ export default function WorkbenchApp() {
   const [notice, setNotice] = useState('');
   const [dragOver, setDragOver] = useState(false);
 
-  // 最近一次映射：仅内存（文档 4.7）
-  const lastMapping = useRef<Record<string, string>>({});
+  // 最近一次映射（文档 4.7）：用 state 而非 ref，使映射更新后还原模式的
+  // useMemo 能正确重算——之前用 ref 时映射变化不触发重渲染，还原模式拿到的
+  // 是旧值，且重开工作台后映射恒空，导致"还原模式没反应"。
+  const [lastMapping, setLastMapping] = useState<Record<string, string>>({});
   const debounceTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const workerRef = useRef<Worker | null>(null);
   const resultRef = useRef<HTMLDivElement>(null);
@@ -44,13 +47,22 @@ export default function WorkbenchApp() {
     [schemes, schemeId],
   );
 
-  // 初始化：取方案列表 + 右键菜单带入的文本
+  // 初始化：取方案列表 + 右键菜单带入的文本 + （开启本地保留时）恢复最近映射
   useEffect(() => {
     void (async () => {
       const list = await sendMessage({ type: 'GET_SCHEMES' });
       setSchemes(list);
       const active = await sendMessage({ type: 'GET_ACTIVE_SCHEME' });
       if (active) setSchemeId(active.id);
+      // 若用户在设置中开启了"保存映射到本地"，恢复最近一次映射，
+      // 否则重开工作台后还原模式恒空映射、无法还原。
+      const settings = await getSettings();
+      if (settings?.persistMappings) {
+        const recs = await getMappings();
+        if (recs[0]?.mapping && Object.keys(recs[0].mapping).length > 0) {
+          setLastMapping(recs[0].mapping);
+        }
+      }
       const pending = await chrome.storage.session.get('vesper:pendingInput');
       const text = pending['vesper:pendingInput'];
       if (typeof text === 'string' && text) {
@@ -83,7 +95,7 @@ export default function WorkbenchApp() {
   function applyResult(r: DesensitizeResult, sch: Scheme) {
     setRes(r);
     if (Object.keys(r.mapping).length > 0) {
-      lastMapping.current = r.mapping;
+      setLastMapping(r.mapping);
       void sendMessage({ type: 'RECORD_MAPPING', schemeId: sch.id, mapping: r.mapping });
     }
   }
@@ -97,8 +109,8 @@ export default function WorkbenchApp() {
   }, [input, scheme, runEngine]);
 
   const restoreOutput = useMemo(
-    () => (mode === 'restore' ? restore(restoreInput, lastMapping.current) : ''),
-    [mode, restoreInput],
+    () => (mode === 'restore' ? restore(restoreInput, lastMapping) : ''),
+    [mode, restoreInput, lastMapping],
   );
 
   async function copyText(text: string) {
@@ -165,7 +177,7 @@ export default function WorkbenchApp() {
     return parts;
   }, [res]);
 
-  const mappingSize = Object.keys(lastMapping.current).length;
+  const mappingSize = Object.keys(lastMapping).length;
 
   return (
     <div className="flex h-screen flex-col">
@@ -311,7 +323,20 @@ export default function WorkbenchApp() {
               </button>
             </div>
             <div className="min-h-0 flex-1 overflow-auto whitespace-pre-wrap break-all p-3 font-mono text-sm">
-              {restoreOutput}
+              {mappingSize === 0 ? (
+                <p className="text-xs leading-relaxed text-[var(--vesper-text-dim)]">
+                  {t.workbench.restoreNoMappingHint}
+                </p>
+              ) : restoreInput && restoreOutput === restoreInput ? (
+                <>
+                  {restoreOutput}
+                  <p className="mt-3 text-xs text-[var(--vesper-text-dim)]">
+                    {t.workbench.restoreNoMatch}
+                  </p>
+                </>
+              ) : (
+                restoreOutput
+              )}
             </div>
             <div className="px-3 py-1 text-[10px] text-[var(--vesper-text-dim)]">
               {t.workbench.noMapping}

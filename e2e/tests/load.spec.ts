@@ -15,7 +15,7 @@ const EXT_PATH = resolve(dirname(fileURLToPath(import.meta.url)), '../../.output
 
 const test = base.extend<{ extensionId: string }, { extCtx: BrowserContext }>({
   extCtx: [
-    async (_fixtures, use) => {
+    async ({}, use) => {
       const ctx = await chromium.launchPersistentContext('', {
         headless: false,
         args: [`--disable-extensions-except=${EXT_PATH}`, `--load-extension=${EXT_PATH}`],
@@ -68,4 +68,23 @@ test('种子数据就绪：默认方案与预置站点已写入', async ({ extCt
   await page.goto(`chrome-extension://${extensionId}/popup.html`);
   // 方案下拉应有"默认方案"选项
   await expect(page.locator('option', { hasText: '默认方案' })).toHaveCount(1);
+});
+
+test('还原模式：脱敏产物的占位符可还原回原文', async ({ extCtx, extensionId }) => {
+  const page = await extCtx.newPage();
+  await page.goto(`chrome-extension://${extensionId}/workbench.html`);
+  const textarea = page.locator('textarea').first();
+  const result = page.locator('div.whitespace-pre-wrap').first();
+
+  // 1) 脱敏模式：输入带邮箱文本，等待占位符出现在结果区
+  await textarea.fill('联系 zhangsan@acme.com 或 zhangsan@acme.com');
+  await expect(result).toContainText('[EMAIL_1]', { timeout: 5000 });
+  const desens = (await result.innerText()).trim();
+
+  // 2) 切到还原模式，把脱敏产物粘进还原框
+  await page.getByRole('button', { name: '还原模式' }).click();
+  await page.locator('textarea').first().fill(desens);
+
+  // 3) 还原输出区应包含原文邮箱（同值一致 → 同一占位符还原为同一原值）
+  await expect(result).toContainText('zhangsan@acme.com', { timeout: 3000 });
 });

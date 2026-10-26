@@ -14,7 +14,7 @@ const EXT_PATH = resolve(dirname(fileURLToPath(import.meta.url)), '../../.output
 
 // 配置页会修改 storage，故每测试用独立 persistent context（隔离存储，避免互相污染）
 const test = base.extend<{ extCtx: BrowserContext; extensionId: string }>({
-  extCtx: async (_fixtures, use) => {
+  extCtx: async ({}, use) => {
     const ctx = await chromium.launchPersistentContext('', {
       headless: false,
       args: [`--disable-extensions-except=${EXT_PATH}`, `--load-extension=${EXT_PATH}`],

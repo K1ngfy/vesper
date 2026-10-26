@@ -24,6 +24,9 @@ export default tseslint.config(
     files: ['tests/**/*', 'e2e/tests/**/*'],
     rules: {
       '@typescript-eslint/no-non-null-assertion': 'off',
+      // Playwright fixture 第一参数必须是解构对象，空解构 {} 合理，不报错
+      '@typescript-eslint/no-empty-pattern': 'off',
+      'no-empty-pattern': 'off',
     },
   },
   prettier,

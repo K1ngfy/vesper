@@ -120,10 +120,13 @@ export const zhCN = {
     duration: '耗时',
     restoreMode: '还原模式',
     desensitizeMode: '脱敏模式',
-    restorePlaceholder: '粘贴 AI 回复，按最近一次映射还原',
-    restoreEmpty: '暂无可还原的映射（mask 模式不可逆，不产生映射）',
+    restorePlaceholder: '粘贴含占位符（如 [EMAIL_1]）的脱敏文本，自动按最近映射还原',
+    restoreEmpty: '暂无可还原的映射',
+    restoreNoMappingHint:
+      '当前没有可还原的映射。请先在「脱敏模式」处理一段含 numbered/fixed 规则的文本（mask 模式不可逆、不产生映射）；或在「设置」中开启「保存映射到本地」，下次打开工作台可恢复最近 20 次映射。',
+    restoreNoMatch: '输入文本中未匹配到任何已知占位符，原样输出',
     mappingCount: (n: number) => `当前映射 ${n} 条`,
-    noMapping: '映射仅保存在内存中，关闭本页即销毁',
+    noMapping: '映射仅保存在本页内存中，关闭即销毁；在「设置」开启本地保留可跨会话恢复',
   },
 
   content: {

@@ -58,8 +58,25 @@ export default function App() {
   }
 
   async function openSidePanel() {
-    const win = await chrome.windows.getCurrent();
-    await chrome.sidePanel.open({ windowId: win.id! });
+    // 优先用原生 sidePanel（Chrome / Edge 支持）；Arc 等浏览器不支持
+    // chrome.sidePanel API，open() 会抛错——此时降级为独立面板窗口，
+    // 否则错误被 void 静默吞掉，用户看到"点了没反应"。
+    try {
+      if (chrome.sidePanel?.open) {
+        const win = await chrome.windows.getCurrent();
+        await chrome.sidePanel.open({ windowId: win.id! });
+        window.close();
+        return;
+      }
+    } catch {
+      // 落到下方降级方案
+    }
+    await chrome.windows.create({
+      url: chrome.runtime.getURL('/sidepanel.html'),
+      type: 'panel',
+      width: 520,
+      height: 760,
+    });
     window.close();
   }
 
