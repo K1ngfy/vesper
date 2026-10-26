@@ -10,7 +10,7 @@
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { desensitize } from '../core/engine';
-import { restore } from '../core/restore';
+import { restoreWithMarks } from '../core/restore';
 import type { DesensitizeResult, Hit, Scheme } from '../core/types';
 import { sendMessage } from '../messages';
 import { getMappings, getSettings } from '../storage';
@@ -108,10 +108,15 @@ export default function WorkbenchApp() {
     return () => clearTimeout(debounceTimer.current);
   }, [input, scheme, runEngine]);
 
-  const restoreOutput = useMemo(
-    () => (mode === 'restore' ? restore(restoreInput, lastMapping) : ''),
+  // 还原结果：output 为纯文本（供复制），marks 标记每个被还原片段位置（供高亮）
+  const restoreResult = useMemo(
+    () =>
+      mode === 'restore'
+        ? restoreWithMarks(restoreInput, lastMapping)
+        : { output: '', marks: [] },
     [mode, restoreInput, lastMapping],
   );
+  const restoreOutput = restoreResult.output;
 
   async function copyText(text: string) {
     try {
@@ -176,6 +181,25 @@ export default function WorkbenchApp() {
     parts.push(res.output.slice(cursor));
     return parts;
   }, [res]);
+
+  /** 还原模式渲染：按 mark.index 高亮被还原片段（原占位符位置 → 现原值），悬停显示占位符 */
+  const restoredHighlighted = useMemo(() => {
+    const { output, marks } = restoreResult;
+    if (marks.length === 0) return output;
+    const parts: React.ReactNode[] = [];
+    let cursor = 0;
+    marks.forEach((mk, i) => {
+      if (mk.index > cursor) parts.push(output.slice(cursor, mk.index));
+      parts.push(
+        <mark key={i} className="vesper-mark" title={`${mk.placeholder} → ${mk.original}`}>
+          {output.slice(mk.index, mk.index + mk.length)}
+        </mark>,
+      );
+      cursor = mk.index + mk.length;
+    });
+    parts.push(output.slice(cursor));
+    return parts;
+  }, [restoreResult]);
 
   const mappingSize = Object.keys(lastMapping).length;
 
@@ -327,7 +351,7 @@ export default function WorkbenchApp() {
                 <p className="text-xs leading-relaxed text-[var(--vesper-text-dim)]">
                   {t.workbench.restoreNoMappingHint}
                 </p>
-              ) : restoreInput && restoreOutput === restoreInput ? (
+              ) : restoreResult.marks.length === 0 ? (
                 <>
                   {restoreOutput}
                   <p className="mt-3 text-xs text-[var(--vesper-text-dim)]">
@@ -335,7 +359,7 @@ export default function WorkbenchApp() {
                   </p>
                 </>
               ) : (
-                restoreOutput
+                restoredHighlighted
               )}
             </div>
             <div className="px-3 py-1 text-[10px] text-[var(--vesper-text-dim)]">
