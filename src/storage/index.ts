@@ -13,8 +13,8 @@
  * - vesper:mappings  最近映射（默认不开启；开启后最多 20 条，文档 4.7）
  * - vesper:meta      { schemaVersion }（数据迁移用）
  */
-import { createDefaultScheme, genId, PRESET_SITES } from '../core/presets';
-import type { Scheme, SiteRule } from '../core/types';
+import { createDefaultScheme, genId, normalizeHost, PRESET_HOST_CATEGORY, PRESET_SITES } from '../core/presets';
+import type { Scheme, SiteRule, SiteScope } from '../core/types';
 
 export interface Settings {
   globalEnabled: boolean;
@@ -23,6 +23,10 @@ export interface Settings {
   dailyCount: { date: string; count: number };
   /** 是否把最近映射保留到本地（默认关，文档 4.7） */
   persistMappings: boolean;
+  /** 站点作用范围（文档 4.4）：'list' 名单模式（默认）/ 'global' 全局模式 */
+  siteScope: SiteScope;
+  /** 全局模式下的排除名单（域名数组）；list 模式下忽略 */
+  excludeHosts: string[];
 }
 
 export interface MappingRecord {
@@ -57,7 +61,7 @@ async function set(key: string, value: unknown): Promise<void> {
  */
 export const FOLLOW_ACTIVE_SCHEME = '';
 
-const SCHEMA_VERSION = 2;
+const SCHEMA_VERSION = 6;
 
 /** 首次安装播种：默认方案 + 预置站点（未启用）+ 默认设置；含 schema 版本标记 */
 export async function ensureSeeded(): Promise<void> {
@@ -83,20 +87,80 @@ export async function ensureSeeded(): Promise<void> {
       activeSchemeId: defaultScheme?.id ?? '',
       dailyCount: { date: today(), count: 0 },
       persistMappings: false,
+      siteScope: 'list',
+      excludeHosts: [],
     } satisfies Settings);
   }
 
-  // v2 迁移：预置站点若仍绑定着默认方案（v1 种子行为），改为跟随当前方案。
-  // 只处理 5 个预置匹配模式，用户自建站点的显式绑定不受影响。
+  // v3 迁移：SiteRule 从 matchPattern 迁移到 host 字段。
+  // 解析 *://host/* 或 *://*.host/* 提取根域 host；迁移后清空 matchPattern。
+  if ((meta?.schemaVersion ?? 0) < 3) {
+    const allSites = await getSites();
+    let changed = false;
+    const next = allSites.map((s) => {
+      if (s.host) return s;
+      const host = matchPatternToHost(s.matchPattern ?? '');
+      if (!host) return s;
+      changed = true;
+      return { ...s, host, matchPattern: undefined };
+    });
+    if (changed) await saveSites(next);
+  }
+
+  // v4 迁移：为站点补 category 字段。预置 host 用 PRESET_HOST_CATEGORY，其余标 'custom'。
+  if ((meta?.schemaVersion ?? 0) < 4) {
+    const allSites = await getSites();
+    let changed = false;
+    const next = allSites.map((s) => {
+      if (s.category) return s;
+      changed = true;
+      return { ...s, category: PRESET_HOST_CATEGORY[s.host] ?? 'custom' };
+    });
+    if (changed) await saveSites(next);
+  }
+
+  // v5 迁移：补全缺失的预置站点。老用户升级时把扩充的预置库补齐
+  //（沿用预置默认启用状态，不干扰用户已有启停配置）；用户删过的预置会被加回一次，可再删。
+  if ((meta?.schemaVersion ?? 0) < 5) {
+    const allSites = await getSites();
+    const existingHosts = new Set(allSites.map((s) => normalizeHost(s.host)));
+    let changed = false;
+    const next = [...allSites];
+    for (const p of PRESET_SITES) {
+      if (!existingHosts.has(normalizeHost(p.host))) {
+        changed = true;
+        next.push({ ...p, id: genId(), schemeId: FOLLOW_ACTIVE_SCHEME });
+      }
+    }
+    if (changed) await saveSites(next);
+  }
+
+  // v6 迁移：内置预置站点默认启用（黑名单模式开箱全选，预览确认）。
+  if ((meta?.schemaVersion ?? 0) < 6) {
+    const allSites = await getSites();
+    const presetHosts = new Set(PRESET_SITES.map((p) => normalizeHost(p.host)));
+    let changed = false;
+    const next = allSites.map((s) => {
+      if (presetHosts.has(normalizeHost(s.host)) && !s.enabled) {
+        changed = true;
+        return { ...s, enabled: true };
+      }
+      return s;
+    });
+    if (changed) await saveSites(next);
+  }
+
+  // v2 迁移：预置站点若仍绑定默认方案（v1 种子行为），改为跟随当前方案。
+  // 基于 host 匹配预置；用户自建站点的显式绑定不受影响。
   if ((meta?.schemaVersion ?? 0) < 2) {
     const allSchemes = await getSchemes();
     const defaultId = allSchemes.find((s) => s.isDefault)?.id;
     if (defaultId) {
-      const presetPatterns = PRESET_SITES.map((s) => s.matchPattern);
+      const presetHosts = PRESET_SITES.map((s) => s.host);
       const allSites = await getSites();
       let changed = false;
       const next = allSites.map((s) => {
-        if (presetPatterns.includes(s.matchPattern) && s.schemeId === defaultId) {
+        if (s.host && presetHosts.includes(s.host) && s.schemeId === defaultId) {
           changed = true;
           return { ...s, schemeId: FOLLOW_ACTIVE_SCHEME };
         }
@@ -145,15 +209,42 @@ export async function saveSites(sites: SiteRule[]): Promise<void> {
   await set(KEYS.sites, sites);
 }
 
-/** 按 URL 找到命中的站点规则（matchPattern 转正则，支持 * 通配） */
+/** 按 URL 找到命中的站点规则（host 后缀匹配：根域或其任意子域） */
 export async function findSiteByUrl(url: string): Promise<SiteRule | undefined> {
   const sites = await getSites();
-  return sites.find((s) => matchPatternToRegex(s.matchPattern).test(url));
+  const host = urlToHost(url);
+  if (!host) return undefined;
+  return sites.find((s) => hostMatches(host, s.host));
 }
 
-export function matchPatternToRegex(pattern: string): RegExp {
-  const escaped = pattern.replace(/[.+?^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*');
-  return new RegExp(`^${escaped}$`);
+/** 从 URL 提取 hostname（小写） */
+export function urlToHost(url: string): string {
+  try {
+    return new URL(url).hostname.toLowerCase();
+  } catch {
+    return '';
+  }
+}
+
+/** 判断 urlHost 是否命中规则 ruleHost：'*' 匹配全部；'*.x' 与 'x' 均匹配根域及所有子域 */
+export function hostMatches(host: string, ruleHost: string): boolean {
+  if (!host || !ruleHost) return false;
+  if (ruleHost === '*') return true;
+  const base = normalizeHost(ruleHost);
+  return host === base || host.endsWith('.' + base);
+}
+
+/** 由 host 派生 origin（根域 + 子域两条；'*' 派生全局一条），用于权限申请与 content script 注册 */
+export function hostToOrigins(host: string): string[] {
+  if (host === '*') return ['*://*/*'];
+  const base = normalizeHost(host);
+  return [`*://${base}/*`, `*://*.${base}/*`];
+}
+
+/** 从旧 matchPattern（*://host/* 或 *://*.host/*）提取根域 host；失败返回空串（迁移用） */
+export function matchPatternToHost(pattern: string): string {
+  const m = pattern.match(/^\*{0,2}[a-z*]+:\/\/(\*\.)?([^/\s]+)\/\*?$/i);
+  return m?.[2]?.toLowerCase() ?? '';
 }
 
 // ---------- 设置 ----------
@@ -191,11 +282,19 @@ export async function getMappings(): Promise<MappingRecord[]> {
 }
 
 export async function pushMapping(rec: MappingRecord): Promise<void> {
+  // 最近一次映射始终写入 session（供右键还原 / 工作台还原；关闭浏览器即销毁）
+  await chrome.storage.session.set({ 'vesper:lastMapping': rec });
   const settings = await getSettings();
-  if (!settings?.persistMappings) return; // 默认关：不落盘
+  if (!settings?.persistMappings) return; // 默认关：不持久化到 local
   const list = await getMappings();
   list.unshift(rec);
   await set(KEYS.mappings, list.slice(0, 20)); // 最多保留 20 次
+}
+
+/** 读取最近一次脱敏映射（session，供右键还原；persistMappings 关闭时也可用） */
+export async function getLastMapping(): Promise<MappingRecord | undefined> {
+  const obj = await chrome.storage.session.get('vesper:lastMapping');
+  return obj['vesper:lastMapping'] as MappingRecord | undefined;
 }
 
 // ---------- 导入 / 导出 / 清除 ----------
@@ -221,6 +320,8 @@ export async function exportAll(): Promise<ExportBundle> {
       globalEnabled: settings?.globalEnabled ?? true,
       activeSchemeId: settings?.activeSchemeId ?? '',
       persistMappings: settings?.persistMappings ?? false,
+      siteScope: settings?.siteScope ?? 'list',
+      excludeHosts: settings?.excludeHosts ?? [],
     },
   };
 }
@@ -253,7 +354,7 @@ export function validateImport(data: unknown): string | null {
   }
   if (!Array.isArray(d.sites)) return '缺少站点列表';
   for (const s of d.sites) {
-    if (typeof s?.id !== 'string' || typeof s?.matchPattern !== 'string') {
+    if (typeof s?.id !== 'string' || typeof s?.host !== 'string') {
       return '站点结构不合法';
     }
   }

@@ -1,11 +1,23 @@
 /**
  * Popup（VESPEER.md 4.5，T7）：总开关、方案切换、当前站点状态、
+ * 渐进授权（list 模式「在此站点启用」/ global 模式「开启全局拦截」）、
  * 三个入口（工作台/配置/侧边栏）、今日脱敏次数。
+ *
+ * 渐进授权：list 模式下未配置/无权限的当前标签页可一键申请该域两条 origin
+ * 并加入名单启用，替代「全局权限」诉求，守住 D5 最小权限。
  */
 import { useEffect, useState } from 'react';
-import type { Scheme } from '@/src/core/types';
+import type { Scheme, SiteRule, SiteScope } from '@/src/core/types';
 import { sendMessage, type SiteStateResponse } from '@/src/messages';
-import { getSettings, saveSettings } from '@/src/storage';
+import {
+  getSettings,
+  saveSettings,
+  getSites,
+  saveSites,
+  hostToOrigins,
+  urlToHost,
+} from '@/src/storage';
+import { genId } from '@/src/core/presets';
 import { t } from '@/src/i18n';
 
 const STATUS_CLS: Record<string, string> = {
@@ -20,7 +32,16 @@ export default function App() {
   const [schemes, setSchemes] = useState<Scheme[]>([]);
   const [schemeId, setSchemeId] = useState('');
   const [siteState, setSiteState] = useState<SiteStateResponse | null>(null);
+  const [scope, setScope] = useState<SiteScope>('list');
   const [count, setCount] = useState(0);
+  const [busy, setBusy] = useState(false);
+
+  async function refreshSiteState() {
+    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+    if (tab?.url) {
+      setSiteState(await sendMessage({ type: 'GET_SITE_STATE', url: tab.url }));
+    }
+  }
 
   useEffect(() => {
     void (async () => {
@@ -32,15 +53,11 @@ export default function App() {
       if (settings) {
         setGlobalEnabled(settings.globalEnabled);
         setSchemeId(settings.activeSchemeId);
+        setScope(settings.siteScope ?? 'list');
       }
       setSchemes(list);
       setCount(c);
-
-      // 当前标签页站点状态（activeTab 权限：点击 Popup 即为用户调用）
-      const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-      if (tab?.url) {
-        setSiteState(await sendMessage({ type: 'GET_SITE_STATE', url: tab.url }));
-      }
+      await refreshSiteState();
     })();
   }, []);
 
@@ -55,6 +72,49 @@ export default function App() {
   async function switchScheme(id: string) {
     setSchemeId(id);
     await sendMessage({ type: 'SET_ACTIVE_SCHEME', schemeId: id });
+  }
+
+  /** list 模式渐进授权：申请当前域名两条 origin 并加入名单启用 */
+  async function enableCurrentSite() {
+    setBusy(true);
+    try {
+      const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+      if (!tab?.url) return;
+      const host = urlToHost(tab.url);
+      if (!host) return;
+      const origins = hostToOrigins(host);
+      const granted = await chrome.permissions.request({ origins });
+      if (!granted) return;
+      const sites = await getSites();
+      const existing = sites.find((s) => s.host === host);
+      const next: SiteRule[] = existing
+        ? sites.map((s) => (s.id === existing.id ? { ...s, enabled: true } : s))
+        : [...sites, { id: genId(), host, schemeId: '', enabled: true, mode: 'preview' }];
+      await saveSites(next);
+      await sendMessage({ type: 'REFRESH_SITE_REGISTRATIONS' });
+      await refreshSiteState();
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  /** global 模式：申请全局通配权限并切换作用范围 */
+  async function enableGlobal() {
+    setBusy(true);
+    try {
+      const granted = await chrome.permissions.request({ origins: ['*://*/*'] });
+      if (!granted) return;
+      const settings = await getSettings();
+      if (settings) {
+        settings.siteScope = 'global';
+        await saveSettings(settings);
+        setScope('global');
+      }
+      await sendMessage({ type: 'REFRESH_SITE_REGISTRATIONS' });
+      await refreshSiteState();
+    } finally {
+      setBusy(false);
+    }
   }
 
   async function openSidePanel() {
@@ -91,6 +151,19 @@ export default function App() {
           ? t.popup.siteNoPermission
           : t.popup.siteUnconfigured;
 
+  // 渐进授权按钮：list 模式下未配置/无权限可一键启用当前站点；
+  // global 模式下无 *://*/* 权限可一键开启全局拦截。
+  const canEnableHere =
+    scope === 'list' && (statusKey === 'unconfigured' || statusKey === 'no-permission');
+  const canEnableGlobal = scope === 'global' && statusKey === 'no-permission';
+  const showEnableButton = !busy && (canEnableHere || canEnableGlobal);
+  const enableLabel = busy
+    ? t.popup.enabling
+    : canEnableGlobal
+      ? t.popup.enableGlobal
+      : t.popup.enableHere;
+  const onEnable = canEnableGlobal ? enableGlobal : enableCurrentSite;
+
   return (
     <div className="w-72 p-4" style={{ background: 'var(--vesper-bg-2)' }}>
       <div className="mb-1 flex items-center justify-between">
@@ -125,10 +198,19 @@ export default function App() {
         </select>
       </div>
 
-      <div className="mb-3 flex items-center justify-between rounded-md border border-[var(--vesper-border)] px-3 py-2 text-xs">
+      <div className="mb-2 flex items-center justify-between rounded-md border border-[var(--vesper-border)] px-3 py-2 text-xs">
         <span className="text-[var(--vesper-text-dim)]">{t.popup.siteState}</span>
         <span className={STATUS_CLS[statusKey]}>{statusText}</span>
       </div>
+
+      {showEnableButton && (
+        <button
+          className="mb-3 w-full rounded-md bg-black px-3 py-2 text-xs font-medium text-white hover:brightness-150"
+          onClick={() => void onEnable()}
+        >
+          {enableLabel}
+        </button>
+      )}
 
       <div className="mb-3 grid grid-cols-3 gap-2 text-xs">
         <button

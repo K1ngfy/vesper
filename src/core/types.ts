@@ -53,11 +53,21 @@ export interface DesensitizeResult {
 
 export type SiteMode = 'auto' | 'preview' | 'warn-only';
 
+export type SiteScope = 'list' | 'global';
+
+/** 站点分类（文档 4.4）：预置站点按用途分组，便于用户查找与一键启用 */
+export type SiteCategory = 'ai' | 'search' | 'translate' | 'custom';
+
 export interface SiteRule {
   id: string;
-  matchPattern: string;
-  /** 显示名称（可选）；为空时回退到 SITE_DISPLAY_NAMES 或 matchPattern */
+  /** 域名匹配模式：精确域名（chatgpt.com，自动覆盖子域）、通配（*.chatgpt.com）或 *（全部站点） */
+  host: string;
+  /** @deprecated v3 起改用 host；迁移期保留兼容，新数据为空 */
+  matchPattern?: string;
+  /** 显示名称（可选）；为空时回退到 SITE_DISPLAY_NAMES 或 host */
   name?: string;
+  /** 站点分类；预置站点按用途标注，用户新建默认 'custom' */
+  category?: SiteCategory;
   schemeId: string;
   enabled: boolean;
   mode: SiteMode;

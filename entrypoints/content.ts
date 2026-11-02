@@ -15,6 +15,7 @@
  * - 无命中完全放行，不干预站点默认粘贴（含富文本）。
  */
 import { desensitize } from '@/src/core/engine';
+import EngineWorker from '@/src/core/engine.worker?worker';
 import type { DesensitizeResult, Scheme, SiteRule } from '@/src/core/types';
 import { sendMessage } from '@/src/messages';
 import { pickAdapter } from '@/src/content/adapters';
@@ -82,6 +83,34 @@ function onDrop(e: DragEvent, adapter: Adapter): void {
   handleIntercept(text, e, adapter);
 }
 
+/** 大文本阈值：超过则走 Worker 异步脱敏，避免主线程长时间阻塞（性能优化） */
+const WORKER_THRESHOLD = 100 * 1024;
+
+let engineWorker: Worker | null = null;
+
+/** 大文本脱敏：在 Worker 线程执行，结果经 postMessage 返回（协议同 engine.worker.ts） */
+function desensitizeInWorker(text: string, scheme: Scheme): Promise<DesensitizeResult> {
+  if (!engineWorker) engineWorker = new EngineWorker();
+  const w = engineWorker;
+  return new Promise((resolve, reject) => {
+    const cleanup = () => {
+      w.removeEventListener('message', onMessage);
+      w.removeEventListener('error', onError);
+    };
+    const onMessage = (e: MessageEvent) => {
+      cleanup();
+      resolve(e.data as DesensitizeResult);
+    };
+    const onError = (e: ErrorEvent) => {
+      cleanup();
+      reject(e);
+    };
+    w.addEventListener('message', onMessage);
+    w.addEventListener('error', onError);
+    w.postMessage({ text, scheme });
+  });
+}
+
 function handleIntercept(text: string | undefined, e: Event, adapter: Adapter): void {
   const target = e.target as HTMLElement | null;
   // 护栏链：缺一即放行（含上下文未就绪：未启用站点不干预）
@@ -90,27 +119,62 @@ function handleIntercept(text: string | undefined, e: Event, adapter: Adapter): 
   if (isPasswordField(target)) return;
   if (!adapter.isEditableTarget(target, ctx.site.selector)) return;
 
+  // 大文本：先拦截，再走 Worker 异步脱敏，避免主线程卡顿/崩溃
+  if (text.length >= WORKER_THRESHOLD) {
+    e.preventDefault();
+    e.stopPropagation();
+    void runLargeText(text, target, adapter);
+    return;
+  }
+
   const res = desensitize(text, ctx.scheme);
   if (res.hits.length === 0) return; // 无命中：完全放行，不干预原行为
 
   e.preventDefault();
   e.stopPropagation();
+  dispatchByMode(target, res, text, adapter);
+}
 
-  const mode = ctx.site.mode;
+/** 大文本：Worker 脱敏后按模式分发；无命中补回原文（已 preventDefault） */
+async function runLargeText(text: string, target: HTMLElement, adapter: Adapter): Promise<void> {
+  if (!ctx) return;
+  let res: DesensitizeResult;
+  try {
+    res = await desensitizeInWorker(text, ctx.scheme);
+  } catch {
+    // Worker 失败：补回原文，任何情况下不丢用户文本（文档 4.6 护栏）
+    insertOriginal(target, text, adapter);
+    return;
+  }
+  if (res.hits.length === 0) {
+    insertOriginal(target, text, adapter);
+    return;
+  }
+  dispatchByMode(target, res, text, adapter);
+}
+
+/** 按站点拦截模式分发处理（warn-only / auto / preview） */
+function dispatchByMode(
+  target: HTMLElement,
+  res: DesensitizeResult,
+  original: string,
+  adapter: Adapter,
+): void {
+  const mode = ctx!.site.mode;
   if (mode === 'warn-only') {
     // 仅提醒：放行原文（手动补一次默认粘贴，因为我们已 preventDefault）
-    insertOriginal(target, text, adapter);
+    insertOriginal(target, original, adapter);
     showToast(t.content.toastWarn(res.hits.length));
     return;
   }
   if (mode === 'auto') {
-    applyDesensitized(target, res, text, adapter);
+    applyDesensitized(target, res, original, adapter);
     return;
   }
   // 默认：预览确认
   showPreview(res, {
-    onConfirm: () => applyDesensitized(target, res, text, adapter),
-    onPasteOriginal: () => insertOriginal(target, text, adapter),
+    onConfirm: () => applyDesensitized(target, res, original, adapter),
+    onPasteOriginal: () => insertOriginal(target, original, adapter),
     onCancel: () => {},
   });
 }

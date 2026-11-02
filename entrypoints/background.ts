@@ -13,62 +13,120 @@ import {
   findSiteByUrl,
   getActiveScheme,
   getDailyCount,
+  getLastMapping,
   getSchemes,
   getSettings,
   getSites,
+  hostMatches,
+  hostToOrigins,
   incrementDailyCount,
   pushMapping,
   saveSettings,
+  urlToHost,
 } from '@/src/storage';
 import type { SiteStateResponse } from '@/src/messages';
 import { genId } from '@/src/core/presets';
+import { restore } from '@/src/core/restore';
 
 /** 打开工作台页（新标签页） */
 async function openWorkbench(): Promise<void> {
   await chrome.tabs.create({ url: chrome.runtime.getURL('/workbench.html') });
 }
 
-/** 站点 matchPattern 是否被已授权 origin 覆盖（精确匹配或全主机通配授权） */
-function patternCoveredBy(matchPattern: string, origin: string): boolean {
-  if (origin === '*://*/*') return true;
-  return origin === matchPattern;
+/**
+ * 右键「还原选中文本」：用最近一次脱敏映射还原，复制结果并在页面提示。
+ * 通过 executeScript 在当前标签页执行复制与提示（activeTab 权限由右键手势授予）。
+ */
+async function handleRestoreSelection(
+  info: chrome.contextMenus.OnClickData,
+  tab?: chrome.tabs.Tab,
+): Promise<void> {
+  const text = info.selectionText ?? '';
+  if (!text || tab?.id == null) return;
+  const last = await getLastMapping();
+  const restored = restore(text, last?.mapping ?? {});
+  const changed = restored !== text;
+  await chrome.scripting
+    .executeScript({
+      target: { tabId: tab.id },
+      func: (payload: { text: string; changed: boolean }) => {
+        if (payload.changed) {
+          void navigator.clipboard.writeText(payload.text).catch(() => {});
+        }
+        const tip = document.createElement('div');
+        tip.textContent = payload.changed
+          ? '✳ VESPER 已还原并复制'
+          : '✳ 未检测到可还原的占位符（请先用 VESPER 脱敏）';
+        tip.style.cssText =
+          'position:fixed;top:16px;right:16px;z-index:2147483647;background:#111111;color:#ffffff;padding:10px 14px;border-radius:8px;font:13px -apple-system,"PingFang SC",sans-serif;box-shadow:0 8px 24px rgba(0,0,0,.2);';
+        document.documentElement.appendChild(tip);
+        setTimeout(() => tip.remove(), 2500);
+      },
+      args: [{ text: restored, changed }],
+    })
+    .catch(() => {});
 }
 
-/** 校验 match pattern 形如 *://host/*（chrome.scripting 注册前预检） */
-function isValidMatchPattern(pattern: string): boolean {
-  return (
-    /^\*{0,2}[a-z*]+:\/\/[^/\s]+\/\*?$/i.test(pattern) || /^https?:\/\/[^/\s]+\/\*?$/.test(pattern)
-  );
+/** 判断目标 origin 是否被已授权 origin 覆盖：相等或已授权全局通配权限 */
+function originCoveredBy(target: string, grantedOrigins: string[]): boolean {
+  return grantedOrigins.includes('*://*/*') || grantedOrigins.includes(target);
 }
 
-/** 按站点启用状态 + 主机权限，同步 content script 注册 */
+/**
+ * 按 siteScope + 站点启用状态 + 主机权限，同步 content script 注册（文档 D5 / 4.4）。
+ * - list 模式：逐站点按 host 派生两条 origin（根域 + 子域）注册，需两条均已授权。
+ * - global 模式：注册单个覆盖全部站点的 content script（全局通配 matches），需全局通配权限已授权；
+ *   排除名单由 GET_SITE_STATE 在运行时判定，不在此处区分注册。
+ */
 async function syncContentScriptRegistrations(): Promise<void> {
   const sites = await getSites();
+  const settings = await getSettings();
+  const scope = settings?.siteScope ?? 'list';
   const granted = await chrome.permissions.getAll();
   const origins = granted.origins ?? [];
 
+  // 注销现有 VESPER 注册（站点级 vesper-site-* + 全局级 vesper-global）
   const existing = await chrome.scripting.getRegisteredContentScripts();
-  const ours = existing.filter((s) => s.id.startsWith('vesper-site-'));
+  const ours = existing.filter((s) => s.id.startsWith('vesper-'));
   if (ours.length > 0) {
     await chrome.scripting.unregisterContentScripts({ ids: ours.map((s) => s.id) });
   }
 
-  // 逐站点注册 + 单站点失败不拖垮整批（此前一批注册会因单个非法 pattern 整体静默失败）
+  if (scope === 'global') {
+    if (!origins.includes('*://*/*')) {
+      console.debug('[VESPER] 全局模式未授权 *://*/*，content script 暂未注册');
+      return;
+    }
+    try {
+      await chrome.scripting.registerContentScripts([
+        {
+          id: 'vesper-global',
+          js: ['content-scripts/content.js'],
+          matches: ['*://*/*'],
+          runAt: 'document_start',
+          persistAcrossSessions: true,
+        },
+      ]);
+      console.debug('[VESPER] 全局 content script 已注册');
+    } catch (err) {
+      console.warn('[VESPER] 全局 content script 注册失败:', (err as Error).message);
+    }
+    return;
+  }
+
+  // list 模式：逐站点注册 + 单站点失败不拖垮整批（此前一批注册会因单个非法 pattern 整体静默失败）
   let ok = 0;
   for (const s of sites) {
-    if (!s.enabled) continue;
-    if (!s.matchPattern) continue;
-    if (!origins.some((o) => patternCoveredBy(s.matchPattern, o))) continue;
+    if (!s.enabled || !s.host) continue;
+    const siteOrigins = hostToOrigins(s.host);
+    // 两条 origin 都必须已授权，否则 chrome.scripting 会因未授权 host 整批失败
+    if (!siteOrigins.every((o) => originCoveredBy(o, origins))) continue;
     try {
-      if (!isValidMatchPattern(s.matchPattern)) {
-        console.warn(`[VESPER] 站点 ${s.matchPattern} 的匹配模式不合法，已跳过注册`);
-        continue;
-      }
       await chrome.scripting.registerContentScripts([
         {
           id: `vesper-site-${s.id}`,
           js: ['content-scripts/content.js'],
-          matches: [s.matchPattern],
+          matches: siteOrigins,
           runAt: 'document_start',
           persistAcrossSessions: true,
         },
@@ -76,7 +134,7 @@ async function syncContentScriptRegistrations(): Promise<void> {
       ok += 1;
     } catch (err) {
       // 只记录错误本身，不打印任何用户规则内容（隐私红线）
-      console.warn(`[VESPER] 站点 ${s.matchPattern} 注册失败:`, (err as Error).message);
+      console.warn(`[VESPER] 站点 ${s.host} 注册失败:`, (err as Error).message);
     }
   }
   if (sites.some((s) => s.enabled)) {
@@ -103,6 +161,11 @@ export default defineBackground(() => {
         title: '用 VESPER 脱敏选中文本',
         contexts: ['selection'],
       });
+      chrome.contextMenus.create({
+        id: 'vesper-restore-selection',
+        title: '用 VESPER 还原选中文本',
+        contexts: ['selection'],
+      });
     });
   });
 
@@ -111,7 +174,7 @@ export default defineBackground(() => {
     if (command === 'open-workbench') void openWorkbench();
   });
 
-  chrome.contextMenus.onClicked.addListener((info) => {
+  chrome.contextMenus.onClicked.addListener((info, tab) => {
     if (info.menuItemId === 'vesper-open-workbench') {
       void openWorkbench();
     } else if (info.menuItemId === 'vesper-desensitize-selection' && info.selectionText) {
@@ -119,6 +182,8 @@ export default defineBackground(() => {
       void chrome.storage.session
         .set({ 'vesper:pendingInput': info.selectionText })
         .then(openWorkbench);
+    } else if (info.menuItemId === 'vesper-restore-selection' && info.selectionText) {
+      void handleRestoreSelection(info, tab);
     }
   });
 
@@ -143,19 +208,55 @@ export default defineBackground(() => {
           return;
         }
         case 'GET_SITE_STATE': {
+          const settings = await getSettings();
+          // 总开关关闭：仍返回站点信息供 Popup 展示，但状态为 disabled
+          if (settings?.globalEnabled === false) {
+            const site = await findSiteByUrl(msg.url);
+            return (site
+              ? { status: 'disabled', site }
+              : { status: 'unconfigured' }) satisfies SiteStateResponse;
+          }
+          const scope = settings?.siteScope ?? 'list';
+          const host = urlToHost(msg.url);
+
+          if (scope === 'global') {
+            // 全局模式：排除名单内的 host 不拦截
+            const excluded = (settings?.excludeHosts ?? []).some((eh) => hostMatches(host, eh));
+            if (excluded) {
+              return { status: 'disabled' } satisfies SiteStateResponse;
+            }
+            // 需 *://*/* 已授权
+            const granted = await chrome.permissions.contains({ origins: ['*://*/*'] });
+            if (!granted) return { status: 'no-permission' } satisfies SiteStateResponse;
+            const scheme = await getActiveScheme();
+            if (!scheme) return { status: 'disabled' } satisfies SiteStateResponse;
+            // 全局模式无具体站点，构造虚拟站点（默认预览模式）；scheme 用当前方案
+            return {
+              status: 'enabled',
+              site: {
+                id: 'vesper-global',
+                host: '',
+                schemeId: '',
+                enabled: true,
+                mode: 'preview',
+              },
+              scheme,
+            } satisfies SiteStateResponse;
+          }
+
+          // list 模式：按 URL 命中的站点规则判定
           const site = await findSiteByUrl(msg.url);
           if (!site) return { status: 'unconfigured' } satisfies SiteStateResponse;
-          const settings = await getSettings();
-          if (!site.enabled || settings?.globalEnabled === false) {
-            return { status: 'disabled', site } satisfies SiteStateResponse;
-          }
-          const granted = await chrome.permissions.contains({ origins: [site.matchPattern] });
+          if (!site.enabled) return { status: 'disabled', site } satisfies SiteStateResponse;
+          const siteOrigins = hostToOrigins(site.host);
+          const granted = await chrome.permissions.contains({ origins: siteOrigins });
           if (!granted) return { status: 'no-permission', site } satisfies SiteStateResponse;
           const scheme =
             // schemeId 为空 = 跟随当前方案（Popup 切换即生效）；
             // 非空但已失效（方案被删）时同样回退当前方案
             (await getSchemes()).find((s) => s.id === site.schemeId && site.schemeId !== '') ??
             (await getActiveScheme());
+          if (!scheme) return { status: 'disabled', site } satisfies SiteStateResponse;
           return { status: 'enabled', site, scheme } satisfies SiteStateResponse;
         }
         case 'INCREMENT_COUNT':

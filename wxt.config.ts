@@ -11,8 +11,8 @@ import tailwindcss from '@tailwindcss/vite';
  * - scripting：按"已启用且已授权"的站点动态注册 content script（D5 最小权限的
  *   实现手段；文档第 7 节未列出，属文档未覆盖细节，按最小权限原则补充）。
  * - activeTab：Popup 显示"当前标签页站点拦截状态"时读取活动标签 URL。
- * - optional_host_permissions（全主机通配）：用户添加站点时按域名逐个申请，
- *   默认不申请任何主机权限（D5）。
+ * - optional_host_permissions（全主机通配）：默认按域名逐个申请；
+ *   用户主动开启全局模式时可申请全局通配权限整体授权（D5 修订）。
  *
  * 禁止项（文档第 7 节）：tabs 全量、webRequest、clipboardRead、默认远程主机权限。
  */

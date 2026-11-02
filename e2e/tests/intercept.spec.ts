@@ -16,7 +16,7 @@ const FIXTURE = new URL('../fixtures/intercept-test.html', import.meta.url).path
 function makeSiteState(mode: 'auto' | 'preview' | 'warn-only') {
   return {
     status: 'enabled',
-    site: { id: 'site1', matchPattern: '*://example.com/*', schemeId: 'sch1', enabled: true, mode },
+    site: { id: 'site1', host: 'example.com', schemeId: 'sch1', enabled: true, mode },
     scheme: {
       id: 'sch1',
       name: '测试方案',

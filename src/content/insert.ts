@@ -40,8 +40,13 @@ function insertIntoField(el: HTMLTextAreaElement | HTMLInputElement, text: strin
   }
 }
 
+/** contenteditable 回填上限：超过则返回 false 走剪贴板兜底，避免大文本回填卡顿/崩溃 */
+const CE_INSERT_LIMIT = 200 * 1024;
+
 /** contenteditable：execCommand 优先，Selection/Range 兜底 */
 function insertIntoContentEditable(el: HTMLElement, text: string): boolean {
+  // 大文本不回填到富文本编辑器（ProseMirror/Slate 处理大文档会卡死），改由上层复制到剪贴板
+  if (text.length > CE_INSERT_LIMIT) return false;
   try {
     el.focus();
     const sel = window.getSelection();
