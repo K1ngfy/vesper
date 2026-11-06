@@ -1,7 +1,8 @@
 /**
  * 规则编辑表单（共享组件，2026-10-25 紧凑版）：规则卡片与"添加规则"弹窗共用。
  * 紧凑布局：名称+匹配源+模式同一行；替换/掩码同一行；类型相关选项一行小字；
- * 测试台单行（样本输入 + 内联结果），整体高度约为旧版一半。
+ * showTest（默认 true）控制末尾"样本即时预览"测试台——配置页的规则卡片
+ * 传入 false 以精简布局，仅"添加规则"弹窗保留该测试台。
  */
 import { useState } from 'react';
 import { DETECTOR_LIST } from '../../core/detectors';
@@ -12,9 +13,11 @@ import { t } from '../../i18n';
 interface Props {
   rule: Rule;
   onChange: (rule: Rule) => void;
+  /** 是否显示"输入样本文本，即时预览"测试台（默认显示） */
+  showTest?: boolean;
 }
 
-export default function RuleForm({ rule, onChange }: Props) {
+export default function RuleForm({ rule, onChange, showTest = true }: Props) {
   const [sample, setSample] = useState('');
   const [testOut, setTestOut] = useState('');
   const [testErr, setTestErr] = useState('');
@@ -25,7 +28,7 @@ export default function RuleForm({ rule, onChange }: Props) {
   function update(patch: Partial<Rule>) {
     const next = { ...rule, ...patch };
     onChange(next);
-    if (sample) runTest(sample, next);
+    if (showTest && sample) runTest(sample, next);
   }
 
   function runTest(text: string, r: Rule) {
@@ -175,21 +178,23 @@ export default function RuleForm({ rule, onChange }: Props) {
         </div>
       )}
 
-      {/* 行4：测试台单行 */}
-      <div className="flex items-center gap-2">
-        <input
-          className="min-w-0 flex-1 rounded border border-dashed border-[var(--vesper-border)] bg-transparent px-2 py-1 text-xs outline-none focus:border-black"
-          placeholder={t.options.ruleTestPlaceholder}
-          value={sample}
-          onChange={(e) => runTest(e.target.value, rule)}
-        />
-        {testErr && <span className="shrink-0 text-xs text-neutral-500">⚠ {testErr}</span>}
-        {testOut && (
-          <span className="shrink-0 max-w-[45%] truncate rounded bg-[#f9fafb] px-2 py-0.5 font-mono text-xs text-black">
-            → {testOut}
-          </span>
-        )}
-      </div>
+      {/* 行4：测试台单行（仅"添加规则"弹窗显示） */}
+      {showTest && (
+        <div className="flex items-center gap-2">
+          <input
+            className="min-w-0 flex-1 rounded border border-dashed border-[var(--vesper-border)] bg-transparent px-2 py-1 text-xs outline-none focus:border-black"
+            placeholder={t.options.ruleTestPlaceholder}
+            value={sample}
+            onChange={(e) => runTest(e.target.value, rule)}
+          />
+          {testErr && <span className="shrink-0 text-xs text-neutral-500">⚠ {testErr}</span>}
+          {testOut && (
+            <span className="shrink-0 max-w-[45%] truncate rounded bg-[#f9fafb] px-2 py-0.5 font-mono text-xs text-black">
+              → {testOut}
+            </span>
+          )}
+        </div>
+      )}
     </div>
   );
 }
