@@ -15,6 +15,7 @@ import {
   type Settings,
 } from '../../storage';
 import { t } from '../../i18n';
+import Toggle from '../Toggle';
 
 export default function SettingsTab() {
   const [settings, setSettings] = useState<Settings | null>(null);
@@ -84,11 +85,9 @@ export default function SettingsTab() {
       <section className="space-y-3">
         <label className="flex items-center justify-between rounded-lg border border-[var(--vesper-border)] bg-[#ffffff] px-4 py-3 text-sm">
           {t.popup.globalSwitch}
-          <input
-            type="checkbox"
-            className="accent-[var(--vesper-accent)]"
+          <Toggle
             checked={settings?.globalEnabled ?? true}
-            onChange={(e) => update({ globalEnabled: e.target.checked })}
+            onChange={(v) => update({ globalEnabled: v })}
           />
         </label>
 
@@ -99,11 +98,9 @@ export default function SettingsTab() {
               {t.options.persistMappingsDesc}
             </span>
           </span>
-          <input
-            type="checkbox"
-            className="mt-1 shrink-0 accent-black"
+          <Toggle
             checked={settings?.persistMappings ?? false}
-            onChange={(e) => void onTogglePersistMappings(e.target.checked)}
+            onChange={(v) => void onTogglePersistMappings(v)}
           />
         </label>
       </section>

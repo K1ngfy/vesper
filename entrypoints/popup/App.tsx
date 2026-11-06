@@ -19,6 +19,7 @@ import {
 } from '@/src/storage';
 import { genId } from '@/src/core/presets';
 import { t } from '@/src/i18n';
+import Toggle from '@/src/ui/Toggle';
 
 const STATUS_CLS: Record<string, string> = {
   enabled: 'text-black',
@@ -67,6 +68,8 @@ export default function App() {
     settings.globalEnabled = !settings.globalEnabled;
     await saveSettings(settings);
     setGlobalEnabled(settings.globalEnabled);
+    // 状态行跟随刷新：关闭后当前站点应立即显示「已停用」
+    await refreshSiteState();
   }
 
   async function switchScheme(id: string) {
@@ -170,15 +173,16 @@ export default function App() {
         <span className="text-base font-bold">
           <span style={{ color: 'var(--vesper-accent)' }}>✳</span> {t.appName}
         </span>
-        <label className="flex cursor-pointer items-center gap-1 text-xs text-[var(--vesper-text-dim)]">
-          {t.popup.globalSwitch}
-          <input
-            type="checkbox"
-            className="accent-[var(--vesper-accent)]"
+        <div className="flex items-center gap-1.5 text-xs text-[var(--vesper-text-dim)]">
+          <span className="cursor-pointer" onClick={() => void toggleGlobal()}>
+            {t.popup.globalSwitch}
+          </span>
+          <Toggle
             checked={globalEnabled}
-            onChange={toggleGlobal}
+            onChange={() => void toggleGlobal()}
+            title={globalEnabled ? t.common.disable : t.common.enable}
           />
-        </label>
+        </div>
       </div>
       <div className="mb-3 text-[11px] text-[var(--vesper-text-dim)]">{t.slogan}</div>
 

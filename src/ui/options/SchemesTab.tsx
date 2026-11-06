@@ -8,8 +8,9 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { genId } from '../../core/presets';
 import type { Rule, RuleType, Scheme } from '../../core/types';
-import { getSchemes, saveSchemes } from '../../storage';
+import { getSchemes, saveSchemes, getSettings, saveSettings } from '../../storage';
 import { t } from '../../i18n';
+import Toggle from '../Toggle';
 import RuleCard from './RuleCard';
 import AddRuleModal from './AddRuleModal';
 
@@ -113,6 +114,14 @@ export default function SchemesTab() {
   function setDefault() {
     if (!selected) return;
     void persist(schemes.map((s) => ({ ...s, isDefault: s.id === selected.id })));
+    // 设默认方案后，当前方案自动跟随（Popup 与站点拦截均按新默认方案）
+    void (async () => {
+      const settings = await getSettings();
+      if (settings) {
+        settings.activeSchemeId = selected.id;
+        await saveSettings(settings);
+      }
+    })();
   }
 
   function moveRule(from: number, to: number) {
@@ -179,12 +188,10 @@ export default function SchemesTab() {
                 value={selected.name}
                 onChange={(e) => updateScheme({ name: e.target.value })}
               />
-              <label className="flex items-center gap-1 text-xs text-[var(--vesper-text-dim)]">
-                <input
-                  type="checkbox"
-                  className="accent-black"
+              <label className="flex items-center gap-1.5 text-xs text-[var(--vesper-text-dim)]">
+                <Toggle
                   checked={selected.enabled}
-                  onChange={(e) => updateScheme({ enabled: e.target.checked })}
+                  onChange={(v) => updateScheme({ enabled: v })}
                 />
                 {t.common.enable}
               </label>

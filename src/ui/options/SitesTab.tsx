@@ -23,6 +23,7 @@ import {
   hostToOrigins,
 } from '../../storage';
 import { t } from '../../i18n';
+import Toggle from '../Toggle';
 
 /** 域名/通配模式校验：接受 example.com、*.example.com、*；拒绝含协议/路径的输入 */
 function isValidHostPattern(input: string): boolean {
@@ -292,13 +293,11 @@ export default function SitesTab() {
           >
             {site.host}
           </span>
-          <button
-            className={`text-left text-xs ${site.enabled ? 'text-black' : 'text-neutral-400'}`}
-            onClick={() => void toggleSite(site)}
+          <Toggle
+            checked={site.enabled}
+            onChange={() => void toggleSite(site)}
             title={site.enabled ? t.common.disable : t.common.enable}
-          >
-            {site.enabled ? t.options.statusEnabled : t.options.statusDisabled}
-          </button>
+          />
           <select
             className="w-full rounded border border-[var(--vesper-border)] bg-white px-1.5 py-1 text-xs"
             value={site.schemeId}
@@ -374,17 +373,6 @@ export default function SitesTab() {
         <div className="grid gap-2 sm:grid-cols-2">
           <button
             className={`rounded-lg border p-3 text-left text-sm ${
-              scope === 'list'
-                ? 'border-black bg-neutral-50'
-                : 'border-[var(--vesper-border)] bg-white hover:border-neutral-400'
-            }`}
-            onClick={() => scope !== 'list' && void persistScope('list')}
-          >
-            <div className="font-medium">{t.options.scopeList}</div>
-            <div className="mt-1 text-xs text-[var(--vesper-text-dim)]">{t.options.scopeListDesc}</div>
-          </button>
-          <button
-            className={`rounded-lg border p-3 text-left text-sm ${
               scope === 'global'
                 ? 'border-black bg-neutral-50'
                 : 'border-[var(--vesper-border)] bg-white hover:border-neutral-400'
@@ -393,6 +381,17 @@ export default function SitesTab() {
           >
             <div className="font-medium">{t.options.scopeGlobal}</div>
             <div className="mt-1 text-xs text-[var(--vesper-text-dim)]">{t.options.scopeGlobalDesc}</div>
+          </button>
+          <button
+            className={`rounded-lg border p-3 text-left text-sm ${
+              scope === 'list'
+                ? 'border-black bg-neutral-50'
+                : 'border-[var(--vesper-border)] bg-white hover:border-neutral-400'
+            }`}
+            onClick={() => scope !== 'list' && void persistScope('list')}
+          >
+            <div className="font-medium">{t.options.scopeList}</div>
+            <div className="mt-1 text-xs text-[var(--vesper-text-dim)]">{t.options.scopeListDesc}</div>
           </button>
         </div>
       </section>
@@ -403,27 +402,16 @@ export default function SitesTab() {
         /* 全局模式：权限状态 + 例外名单 */
         <section className="space-y-3">
           <div className="rounded-lg border border-[var(--vesper-border)] bg-[#ffffff] p-3">
-            {globalGranted ? (
-              <div className="flex items-center justify-between">
-                <span className="text-sm font-medium">{t.options.scopeGlobalGranted}</span>
-                <button
-                  className="text-xs text-neutral-500 hover:text-black"
-                  onClick={() => void disableGlobal()}
-                >
-                  {t.options.scopeGlobalRevoke}
-                </button>
-              </div>
-            ) : (
-              <div className="space-y-2">
-                <p className="text-xs text-[var(--vesper-text-dim)]">{t.options.globalPermissionHint}</p>
-                <button
-                  className="rounded-md bg-black px-4 py-2 text-sm font-medium text-white hover:brightness-150"
-                  onClick={() => void enableGlobal()}
-                >
-                  {t.options.scopeGlobalGrant}
-                </button>
-              </div>
-            )}
+            <div className="flex items-center justify-between">
+              <span className="text-sm font-medium">
+                {globalGranted ? t.options.scopeGlobalGranted : t.options.scopeGlobalGrant}
+              </span>
+              <Toggle
+                checked={globalGranted}
+                onChange={(v) => (v ? void enableGlobal() : void disableGlobal())}
+              />
+            </div>
+            <p className="mt-2 text-xs text-[var(--vesper-text-dim)]">{t.options.globalPermissionHint}</p>
           </div>
 
           <div>
