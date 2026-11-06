@@ -35,6 +35,15 @@ export default defineContentScript({
   registration: 'runtime',
   runAt: 'document_start',
   main() {
+    // 同一 URL 可能被多条站点规则命中（如 *.openai.com 与 chatgpt.com 同时启用），
+    // chrome.scripting 会按注册 id 各注入一份 → 同一页面出现两套监听，
+    // 双重 preventDefault + 双重回填。用 window 标记（同源 isolated world 共享）
+    // 保证只挂载一次。
+    const flag = '__vesperContentMounted__';
+    const w = window as unknown as Record<string, boolean>;
+    if (w[flag]) return;
+    w[flag] = true;
+
     const adapter = pickAdapter(location.href);
     void refreshCtx();
 
@@ -115,32 +124,53 @@ function handleIntercept(text: string | undefined, e: Event, adapter: Adapter): 
   const target = e.target as HTMLElement | null;
   // 护栏链：缺一即放行（含上下文未就绪：未启用站点不干预）
   if (!text || !target || !ctx) return;
+  // 已被其它实例处理过（极端情况下的重复监听）：不再二次拦截
+  if (e.defaultPrevented) return;
   if (isOwnUI(target)) return;
   if (isPasswordField(target)) return;
   if (!adapter.isEditableTarget(target, ctx.site.selector)) return;
+
+  const current = ctx;
+  const mode = current.site.mode;
 
   // 大文本：先拦截，再走 Worker 异步脱敏，避免主线程卡顿/崩溃
   if (text.length >= WORKER_THRESHOLD) {
     e.preventDefault();
     e.stopPropagation();
-    void runLargeText(text, target, adapter);
+    void runLargeText(text, target, adapter, current, mode).catch(() => {
+      // 任何异常都不许让用户丢掉这次粘贴（已被 preventDefault）
+      insertOriginal(target, text, adapter);
+    });
     return;
   }
 
-  const res = desensitize(text, ctx.scheme);
+  let res: DesensitizeResult;
+  try {
+    res = desensitize(text, current.scheme);
+  } catch {
+    // 引擎异常（如用户正则写坏）：放行站点默认粘贴，不干预
+    console.warn('[VESPER] 脱敏引擎异常，本次粘贴放行');
+    return;
+  }
   if (res.hits.length === 0) return; // 无命中：完全放行，不干预原行为
 
   e.preventDefault();
   e.stopPropagation();
-  dispatchByMode(target, res, text, adapter);
+  dispatchByMode(target, res, text, adapter, mode);
 }
 
 /** 大文本：Worker 脱敏后按模式分发；无命中补回原文（已 preventDefault） */
-async function runLargeText(text: string, target: HTMLElement, adapter: Adapter): Promise<void> {
+async function runLargeText(
+  text: string,
+  target: HTMLElement,
+  adapter: Adapter,
+  current: Ctx,
+  mode: SiteRule['mode'],
+): Promise<void> {
   if (!ctx) return;
   let res: DesensitizeResult;
   try {
-    res = await desensitizeInWorker(text, ctx.scheme);
+    res = await desensitizeInWorker(text, current.scheme);
   } catch {
     // Worker 失败：补回原文，任何情况下不丢用户文本（文档 4.6 护栏）
     insertOriginal(target, text, adapter);
@@ -150,7 +180,7 @@ async function runLargeText(text: string, target: HTMLElement, adapter: Adapter)
     insertOriginal(target, text, adapter);
     return;
   }
-  dispatchByMode(target, res, text, adapter);
+  dispatchByMode(target, res, text, adapter, mode);
 }
 
 /** 按站点拦截模式分发处理（warn-only / auto / preview） */
@@ -159,24 +189,32 @@ function dispatchByMode(
   res: DesensitizeResult,
   original: string,
   adapter: Adapter,
+  mode: SiteRule['mode'],
 ): void {
-  const mode = ctx!.site.mode;
-  if (mode === 'warn-only') {
-    // 仅提醒：放行原文（手动补一次默认粘贴，因为我们已 preventDefault）
+  try {
+    if (mode === 'warn-only') {
+      // 仅提醒：放行原文（手动补一次默认粘贴，因为我们已 preventDefault）
+      insertOriginal(target, original, adapter);
+      showToast(t.content.toastWarn(res.hits.length));
+      return;
+    }
+    if (mode === 'auto') {
+      applyDesensitized(target, res, original, adapter);
+      return;
+    }
+    // 默认：预览确认
+    showPreview(res, {
+      onConfirm: () => applyDesensitized(target, res, original, adapter),
+      onPasteOriginal: () => insertOriginal(target, original, adapter),
+      onCancel: () => {},
+    });
+  } catch {
+    // 预览/回填失败（典型：站点 CSP 阻断注入 UI）时，
+    // 退回"补回原文"，绝不出现"粘不进去"的死局
+    console.warn('[VESPER] 拦截处理异常，已回填原文');
     insertOriginal(target, original, adapter);
-    showToast(t.content.toastWarn(res.hits.length));
-    return;
+    showToast(t.content.previewFailed);
   }
-  if (mode === 'auto') {
-    applyDesensitized(target, res, original, adapter);
-    return;
-  }
-  // 默认：预览确认
-  showPreview(res, {
-    onConfirm: () => applyDesensitized(target, res, original, adapter),
-    onPasteOriginal: () => insertOriginal(target, original, adapter),
-    onCancel: () => {},
-  });
 }
 
 /** 回填原文（warn-only / 用户选择粘贴原文） */

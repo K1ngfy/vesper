@@ -181,6 +181,7 @@ export const zhCN = {
     pasteOriginalConfirm: '确认粘贴未脱敏的原文？',
     btnCancel: '取消',
     fallbackCopied: '已脱敏并复制，请按 Ctrl+V 粘贴',
+    previewFailed: '预览未能显示，已按原文粘贴（可改用工作台脱敏）',
   },
 } as const;
 

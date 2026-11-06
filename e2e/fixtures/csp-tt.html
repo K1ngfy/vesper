@@ -1,0 +1,18 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <!-- 复刻 ChatGPT / Claude 等主流站点的 Trusted Types 策略：
+         字符串 innerHTML 在此页面会被直接拒绝（TrustedHTML 错误） -->
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="require-trusted-types-for 'script'; trusted-types default"
+    />
+    <title>VESPER CSP / Trusted Types 测试页</title>
+  </head>
+  <body>
+    <h3>Trusted Types 测试页</h3>
+    <textarea id="ta" placeholder="textarea"></textarea><br />
+    <div id="ce" contenteditable="true" style="width: 400px; height: 80px; border: 1px solid #888"></div>
+  </body>
+</html>

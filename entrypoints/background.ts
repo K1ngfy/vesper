@@ -67,6 +67,62 @@ async function handleRestoreSelection(
     .catch(() => {});
 }
 
+/**
+ * 右键菜单创建（幂等）。
+ *
+ * 历史问题：SW 内 `removeAll(callback) → create` 是"回调式"的异步链，
+ * onInstalled 在开发期/更新期可能连续触发多次，两次链交叠时就会
+ * "Cannot create item with duplicate id vesper-xxx"（unchecked lastError）。
+ * 这里改为：串行队列 + await removeAll + 逐条 create 并吃掉 lastError，
+ * 重复 id 时退化为 update（保证文案是最新的），任何情况都不抛错。
+ */
+let menuQueue: Promise<void> = Promise.resolve();
+
+function createMenusOnce(): Promise<void> {
+  const items: chrome.contextMenus.CreateProperties[] = [
+    { id: 'vesper-open-workbench', title: '打开 VESPER 工作台', contexts: ['action', 'page'] },
+    {
+      id: 'vesper-desensitize-selection',
+      title: '用 VESPER 脱敏选中文本',
+      contexts: ['selection'],
+    },
+    { id: 'vesper-restore-selection', title: '用 VESPER 还原选中文本', contexts: ['selection'] },
+  ];
+
+  return (async () => {
+    try {
+      await chrome.contextMenus.removeAll();
+    } catch {
+      /* 没有旧菜单时无需处理 */
+    }
+    for (const item of items) {
+      await new Promise<void>((resolve) => {
+        chrome.contextMenus.create(item, () => {
+          const err = chrome.runtime.lastError;
+          if (err) {
+            // 重复 id 属可恢复状态（并发/旧实例残留）：改成更新标题即可
+            if (!/duplicate/i.test(err.message ?? '')) {
+              console.warn('[VESPER] 右键菜单创建失败:', err.message);
+            } else if (item.id) {
+              void chrome.contextMenus
+                .update(item.id, { title: item.title })
+                .catch(() => undefined);
+            }
+          }
+          resolve();
+        });
+      });
+    }
+  })();
+}
+
+function setupContextMenus(): Promise<void> {
+  menuQueue = menuQueue.then(createMenusOnce).catch((err) => {
+    console.warn('[VESPER] 右键菜单初始化失败:', (err as Error)?.message ?? err);
+  });
+  return menuQueue;
+}
+
 /** 判断目标 origin 是否被已授权 origin 覆盖：相等或已授权全局通配权限 */
 function originCoveredBy(target: string, grantedOrigins: string[]): boolean {
   return grantedOrigins.includes('*://*/*') || grantedOrigins.includes(target);
@@ -77,8 +133,39 @@ function originCoveredBy(target: string, grantedOrigins: string[]): boolean {
  * - list 模式：逐站点按 host 派生两条 origin（根域 + 子域）注册，需两条均已授权。
  * - global 模式：注册单个覆盖全部站点的 content script（全局通配 matches），需全局通配权限已授权；
  *   排除名单由 GET_SITE_STATE 在运行时判定，不在此处区分注册。
+ *
+ * 并发保护：onInstalled / 权限变化 / REFRESH_SITE_REGISTRATIONS 三方都会触发，
+ * 多次交叠时"注销已被别的调用注销的 id"会抛 Nonexistent script ID（unhandled
+ * rejection）。这里用串行队列 + 容错注销保证同一时刻只有一次同步在执行。
  */
-async function syncContentScriptRegistrations(): Promise<void> {
+let syncQueue: Promise<void> = Promise.resolve();
+
+function syncContentScriptRegistrations(): Promise<void> {
+  syncQueue = syncQueue
+    .then(() => doSyncRegistrations())
+    .catch((err) => console.warn('[VESPER] content script 同步失败:', (err as Error)?.message ?? err));
+  return syncQueue;
+}
+
+/**
+ * 注册单个 content script；遇到"同 id 已存在"（注册表残留/上一轮未注销干净）
+ * 时先单独注销再重试一次，避免整批注册被一条残留记录带崩。
+ */
+async function registerScript(script: chrome.scripting.RegisteredContentScript): Promise<void> {
+  try {
+    await chrome.scripting.registerContentScripts([script]);
+  } catch (err) {
+    if (!/duplicate/i.test((err as Error).message ?? '')) throw err;
+    try {
+      await chrome.scripting.unregisterContentScripts({ ids: [script.id] });
+    } catch {
+      /* 残留记录可能已被清掉，忽略 */
+    }
+    await chrome.scripting.registerContentScripts([script]);
+  }
+}
+
+async function doSyncRegistrations(): Promise<void> {
   const sites = await getSites();
   const settings = await getSettings();
   const scope = settings?.siteScope ?? 'list';
@@ -86,10 +173,20 @@ async function syncContentScriptRegistrations(): Promise<void> {
   const origins = granted.origins ?? [];
 
   // 注销现有 VESPER 注册（站点级 vesper-site-* + 全局级 vesper-global）
-  const existing = await chrome.scripting.getRegisteredContentScripts();
-  const ours = existing.filter((s) => s.id.startsWith('vesper-'));
-  if (ours.length > 0) {
-    await chrome.scripting.unregisterContentScripts({ ids: ours.map((s) => s.id) });
+  let existing: chrome.scripting.RegisteredContentScript[] = [];
+  try {
+    existing = await chrome.scripting.getRegisteredContentScripts();
+  } catch (err) {
+    console.warn('[VESPER] 读取 content script 注册失败:', (err as Error).message);
+  }
+  const ids = existing.filter((s) => s.id.startsWith('vesper-')).map((s) => s.id);
+  if (ids.length > 0) {
+    try {
+      await chrome.scripting.unregisterContentScripts({ ids });
+    } catch (err) {
+      // 已被其它流程注销 / 注册表已失效：都属可恢复状态，不阻断后续注册
+      console.debug('[VESPER] 注销旧注册跳过:', (err as Error).message);
+    }
   }
 
   if (scope === 'global') {
@@ -98,15 +195,13 @@ async function syncContentScriptRegistrations(): Promise<void> {
       return;
     }
     try {
-      await chrome.scripting.registerContentScripts([
-        {
-          id: 'vesper-global',
-          js: ['content-scripts/content.js'],
-          matches: ['*://*/*'],
-          runAt: 'document_start',
-          persistAcrossSessions: true,
-        },
-      ]);
+      await registerScript({
+        id: 'vesper-global',
+        js: ['content-scripts/content.js'],
+        matches: ['*://*/*'],
+        runAt: 'document_start',
+        persistAcrossSessions: true,
+      });
       console.debug('[VESPER] 全局 content script 已注册');
     } catch (err) {
       console.warn('[VESPER] 全局 content script 注册失败:', (err as Error).message);
@@ -122,15 +217,13 @@ async function syncContentScriptRegistrations(): Promise<void> {
     // 两条 origin 都必须已授权，否则 chrome.scripting 会因未授权 host 整批失败
     if (!siteOrigins.every((o) => originCoveredBy(o, origins))) continue;
     try {
-      await chrome.scripting.registerContentScripts([
-        {
-          id: `vesper-site-${s.id}`,
-          js: ['content-scripts/content.js'],
-          matches: siteOrigins,
-          runAt: 'document_start',
-          persistAcrossSessions: true,
-        },
-      ]);
+      await registerScript({
+        id: `vesper-site-${s.id}`,
+        js: ['content-scripts/content.js'],
+        matches: siteOrigins,
+        runAt: 'document_start',
+        persistAcrossSessions: true,
+      });
       ok += 1;
     } catch (err) {
       // 只记录错误本身，不打印任何用户规则内容（隐私红线）
@@ -150,24 +243,11 @@ export default defineBackground(() => {
     void ensureSeeded().then(syncContentScriptRegistrations);
 
     // 右键菜单：打开工作台 + 选中即脱敏（文档 T7）
-    chrome.contextMenus.removeAll(() => {
-      chrome.contextMenus.create({
-        id: 'vesper-open-workbench',
-        title: '打开 VESPER 工作台',
-        contexts: ['action', 'page'],
-      });
-      chrome.contextMenus.create({
-        id: 'vesper-desensitize-selection',
-        title: '用 VESPER 脱敏选中文本',
-        contexts: ['selection'],
-      });
-      chrome.contextMenus.create({
-        id: 'vesper-restore-selection',
-        title: '用 VESPER 还原选中文本',
-        contexts: ['selection'],
-      });
-    });
+    void setupContextMenus();
   });
+
+  // 浏览器启动时补一次菜单（开发重载/异常清理后菜单可能缺失，创建是幂等的）
+  chrome.runtime.onStartup.addListener(() => void setupContextMenus());
 
   // 快捷键 open-workbench（manifest commands）
   chrome.commands.onCommand.addListener((command) => {
