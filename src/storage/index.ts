@@ -13,7 +13,14 @@
  * - vesper:mappings  最近映射（默认不开启；开启后最多 20 条，文档 4.7）
  * - vesper:meta      { schemaVersion }（数据迁移用）
  */
-import { createDefaultScheme, genId, normalizeHost, PRESET_HOST_CATEGORY, PRESET_SITES } from '../core/presets';
+import {
+  createDefaultScheme,
+  DEFAULT_EXCLUDE_HOSTS,
+  genId,
+  normalizeHost,
+  PRESET_HOST_CATEGORY,
+  PRESET_SITES,
+} from '../core/presets';
 import type { Scheme, SiteRule, SiteScope } from '../core/types';
 
 export interface Settings {
@@ -61,7 +68,7 @@ async function set(key: string, value: unknown): Promise<void> {
  */
 export const FOLLOW_ACTIVE_SCHEME = '';
 
-const SCHEMA_VERSION = 6;
+const SCHEMA_VERSION = 7;
 
 /** 首次安装播种：默认方案 + 预置站点（未启用）+ 默认设置；含 schema 版本标记 */
 export async function ensureSeeded(): Promise<void> {
@@ -88,7 +95,7 @@ export async function ensureSeeded(): Promise<void> {
       dailyCount: { date: today(), count: 0 },
       persistMappings: false,
       siteScope: 'list',
-      excludeHosts: [],
+      excludeHosts: [...DEFAULT_EXCLUDE_HOSTS],
     } satisfies Settings);
   }
 
@@ -148,6 +155,15 @@ export async function ensureSeeded(): Promise<void> {
       return s;
     });
     if (changed) await saveSites(next);
+  }
+
+  // v7 迁移：全局模式补默认例外主机（本机回环 + 私有网段）。
+  // 仅在用户例外列表为空时写入，已有自定义例外的不动。
+  if ((meta?.schemaVersion ?? 0) < 7) {
+    const current = await get<Settings>(KEYS.settings);
+    if (current && (!current.excludeHosts || current.excludeHosts.length === 0)) {
+      await set(KEYS.settings, { ...current, excludeHosts: [...DEFAULT_EXCLUDE_HOSTS] });
+    }
   }
 
   // v2 迁移：预置站点若仍绑定默认方案（v1 种子行为），改为跟随当前方案。
@@ -226,12 +242,52 @@ export function urlToHost(url: string): string {
   }
 }
 
-/** 判断 urlHost 是否命中规则 ruleHost：'*' 匹配全部；'*.x' 与 'x' 均匹配根域及所有子域 */
+/** 点分 IPv4 → 32 位整数；非法返回 null */
+function ipv4ToInt(ip: string): number | null {
+  const parts = ip.trim().split('.');
+  if (parts.length !== 4) return null;
+  let out = 0;
+  for (const p of parts) {
+    if (!/^\d{1,3}$/.test(p)) return null;
+    const n = Number(p);
+    if (n > 255) return null;
+    out = out * 256 + n;
+  }
+  return out;
+}
+
+/** host 是否落在 IPv4 CIDR 网段内（如 192.168.0.0/16）；非 IPv4 一律不命中 */
+function ipv4InCidr(host: string, cidr: string): boolean {
+  const [base = '', bitsRaw] = cidr.split('/');
+  const bits = Number(bitsRaw);
+  if (!Number.isInteger(bits) || bits < 0 || bits > 32) return false;
+  const baseInt = ipv4ToInt(base);
+  const hostInt = ipv4ToInt(host);
+  if (baseInt == null || hostInt == null) return false;
+  const mask = bits === 0 ? 0 : (0xffffffff << (32 - bits)) >>> 0;
+  return ((baseInt & mask) >>> 0) === ((hostInt & mask) >>> 0);
+}
+
+/** 去掉 IPv6 字面量的方括号：URL.hostname 给的是 [::1]，用户可能写 ::1 */
+function stripBrackets(host: string): string {
+  return host.startsWith('[') && host.endsWith(']') ? host.slice(1, -1) : host;
+}
+
+/**
+ * 判断 urlHost 是否命中规则 ruleHost：
+ * - '*' 匹配全部；'*.x' 与 'x' 均匹配根域及所有子域；
+ * - 'a.b.c.d/nn' 按 IPv4 CIDR 网段匹配（如 192.168.0.0/16）；
+ * - IPv6 字面量按无括号形式比较（[::1] ≡ ::1）。
+ */
 export function hostMatches(host: string, ruleHost: string): boolean {
   if (!host || !ruleHost) return false;
-  if (ruleHost === '*') return true;
-  const base = normalizeHost(ruleHost);
-  return host === base || host.endsWith('.' + base);
+  const rule = ruleHost.trim().toLowerCase();
+  if (rule === '*') return true;
+  const h = host.trim().toLowerCase();
+  if (rule.includes('/')) return ipv4InCidr(h, rule);
+  const base = normalizeHost(rule);
+  if (h.startsWith('[') || base.startsWith('[')) return stripBrackets(h) === stripBrackets(base);
+  return h === base || h.endsWith('.' + base);
 }
 
 /** 由 host 派生 origin（根域 + 子域两条；'*' 派生全局一条），用于权限申请与 content script 注册 */

@@ -95,7 +95,7 @@ export const zhCN = {
     modeAuto: '自动替换',
     modePreview: '预览确认',
     modeWarnOnly: '仅提醒',
-    scopeTitle: '作用范围',
+    scopeTitle: '情景模式',
     scopeList: '黑名单模式',
     scopeListDesc: '仅拦截下方名单中的站点，逐域名授权（默认）',
     categoryNames: {
@@ -116,16 +116,14 @@ export const zhCN = {
     fieldCategory: '分类',
     hostWildcardHint: '支持通配符：*.example.com 匹配所有子域，* 匹配所有站点',
     scopeGlobal: '全局模式',
-    scopeGlobalDesc: '拦截所有网站，需授权“访问所有网站”权限；可在下方设置例外站点',
-    scopeGlobalGrant: '开启全局拦截',
-    scopeGlobalRevoke: '关闭全局拦截',
-    scopeGlobalGranted: '全局拦截已开启',
-    globalPermissionHint:
-      '全局模式将申请“读取并更改你访问的所有网站”权限。VESPER 全程在本机处理文本，不会上传或传输任何数据。',
+    scopeGlobalDesc: '拦截所有网站，需授权「访问所有网站」权限；可在下方设置例外主机',
+    scopeGlobalNeedGrant: '尚未授权「访问所有网站」，点击本卡片完成授权',
+    scopeActive: '当前正在启用',
     excludeListTitle: '例外站点（不拦截）',
-    excludeListHint: '全局模式下，下列域名的站点不会被拦截',
-    addExclude: '添加例外',
-    excludeEmpty: '请输入要排除的域名',
+    excludeListHint: '每行一个主机或网段，命中的站点不做拦截处理',
+    excludeListTip:
+      '支持通配符与网段：*.example.com 匹配根域及其所有子域，* 匹配全部；192.168.0.0/16 为 IPv4 网段；IPv6 写成 [::1]',
+    excludeEmpty: '每行一个主机，如 127.0.0.1',
     selectorAdvanced: '高级：自定义输入框定位',
     selectorHelp:
       '当某站点的输入框无法被自动识别时可使用。VESPER 会用 el.closest(选择器) 命中的元素作为拦截目标，选择器需匹配输入框本身或其包含元素。',

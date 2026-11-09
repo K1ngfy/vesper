@@ -25,6 +25,18 @@ export function genId(): string {
   return `v_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`;
 }
 
+/**
+ * 全局模式（情景模式）的默认例外主机：本机回环 + 私有网段。
+ * 这些地址通常是本地服务/内网系统，粘贴脱敏没有意义，默认不拦截。
+ * 支持 IPv4、IPv4 CIDR 网段、IPv6 字面量（带方括号，与 URL.hostname 一致）与主机名。
+ */
+export const DEFAULT_EXCLUDE_HOSTS: string[] = [
+  '127.0.0.1',
+  '192.168.0.0/16',
+  '[::1]',
+  'localhost',
+];
+
 function builtinRule(id: BuiltinDetectorId, enabled: boolean): Rule {
   const det = DETECTORS[id];
   return {

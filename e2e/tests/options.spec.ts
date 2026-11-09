@@ -86,20 +86,24 @@ test('快速筛选：按类型过滤且计数正确', async ({ extCtx, extension
   await expect(page.locator('[draggable="true"]')).toHaveCount(Number(count));
 });
 
-test('站点拦截：输入合法模式后添加站点入列；空输入按钮禁用', async ({ extCtx, extensionId }) => {
+test('站点拦截：弹窗添加站点入列 + 空域名校验', async ({ extCtx, extensionId }) => {
   const page = await openOptions(extCtx, extensionId);
   await page.getByText('站点拦截').click();
 
-  // 空输入时按钮禁用（cursor-not-allowed）
-  const addBtn = page.getByRole('button', { name: '添加站点' });
-  await expect(addBtn).toHaveClass(/cursor-not-allowed/);
+  // 打开「添加站点」弹窗（域名输入框是弹窗唯一标识）
+  await page.getByRole('button', { name: '添加站点' }).click();
+  const hostInput = page.getByPlaceholder('*.example.com');
+  await expect(hostInput).toBeVisible();
 
-  // 输入合法模式 + 回车 → 新站点行出现
-  const input = page.getByPlaceholder('匹配模式，如 *://chatgpt.com/*');
-  await input.fill('*://example.com/*');
-  await input.press('Enter');
-  // 新站点行的名称与模式两处都会显示该串，取首个即可
-  await expect(page.getByText('*://example.com/*').first()).toBeVisible();
-  // 添加后输入框清空、按钮恢复禁用（预期行为）
-  await expect(addBtn).toHaveClass(/cursor-not-allowed/);
+  // 空域名点添加：提示且弹窗不关闭
+  await page.getByRole('button', { name: '新增', exact: true }).click();
+  await expect(page.getByText('请先输入域名，如 chatgpt.com')).toBeVisible();
+  await expect(hostInput).toBeVisible();
+
+  // 填合法域名后添加：弹窗关闭、提示成功、列表出现该站点行
+  await hostInput.fill('example.com');
+  await page.getByRole('button', { name: '新增', exact: true }).click();
+  await expect(hostInput).toHaveCount(0);
+  await expect(page.getByText('已添加站点，请点击其开关启用并授予域名权限')).toBeVisible();
+  await expect(page.locator('span.font-mono', { hasText: 'example.com' }).first()).toBeVisible();
 });

@@ -1,12 +1,13 @@
 /**
- * 站点拦截 Tab（文档 4.4）：作用范围切换 + 域名通配 + 行式表格 + 添加弹框。
+ * 站点拦截 Tab（文档 4.4）：情景模式切换 + 域名通配 + 行式表格 + 添加弹框。
  * - list（黑名单）模式：内置站点默认启用（预览确认）；顶部快速筛选 + 批量勾选，
  *   勾选后出现批量操作栏（启用/关闭/拦截模式/绑定方案）。
- * - global 模式：申请全局通配权限，维护排除名单（白名单 = 全局 + 排除语义）。
+ * - global 模式：申请全局通配权限，例外主机用多行文本框维护（每行一条，支持通配/网段）。
  * 添加经弹框填写各字段；selector 覆盖为行内「编辑」展开项。
  */
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import {
+  DEFAULT_EXCLUDE_HOSTS,
   genId,
   normalizeHost,
   SITE_CATEGORY_ORDER,
@@ -58,13 +59,47 @@ const TrashIcon = (
   </svg>
 );
 
+/** 例外主机文本框：按行拆分、去空、去重（保留顺序，不做严格校验以支持网段/IPv6） */
+function parseExcludeText(text: string): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const raw of text.split(/\r?\n/)) {
+    const v = raw.trim().toLowerCase();
+    if (!v || seen.has(v)) continue;
+    seen.add(v);
+    out.push(v);
+  }
+  return out;
+}
+
+/** 生效标记：模式卡片右侧的小图标（实心圆 + 白勾），标识「当前正在启用」 */
+function ActiveBadge({ title }: { title: string }) {
+  return (
+    <span className="inline-flex shrink-0 items-center" title={title} aria-label={title}>
+      <svg width="17" height="17" viewBox="0 0 24 24">
+        <circle cx="12" cy="12" r="10" fill="currentColor" />
+        <path
+          d="M8 12.4l2.6 2.6L16 9.5"
+          fill="none"
+          stroke="#ffffff"
+          strokeWidth="2.4"
+          strokeLinecap="round"
+          strokeLinejoin="round"
+        />
+      </svg>
+    </span>
+  );
+}
+
 export default function SitesTab() {
   const [sites, setSites] = useState<SiteRule[]>([]);
   const [schemes, setSchemes] = useState<Scheme[]>([]);
   const [scope, setScope] = useState<SiteScope>('list');
   const [excludeHosts, setExcludeHosts] = useState<string[]>([]);
+  /** 例外文本框的编辑态（不回写用户输入，避免打字时被规范化打断） */
+  const [excludeText, setExcludeText] = useState('');
+  const excludeTimer = useRef<number | null>(null);
   const [globalGranted, setGlobalGranted] = useState(false);
-  const [newExclude, setNewExclude] = useState('');
   const [notice, setNotice] = useState('');
   const [expanded, setExpanded] = useState<Record<string, boolean>>({});
   const [filter, setFilter] = useState<Filter>('all');
@@ -83,7 +118,9 @@ export default function SitesTab() {
       setSites(s);
       setSchemes(sch);
       setScope(st?.siteScope ?? 'list');
-      setExcludeHosts(st?.excludeHosts ?? []);
+      const exclude = st?.excludeHosts ?? DEFAULT_EXCLUDE_HOSTS;
+      setExcludeHosts(exclude);
+      setExcludeText(exclude.join('\n'));
     });
     void chrome.permissions.contains({ origins: ['*://*/*'] }).then(setGlobalGranted);
   }, []);
@@ -114,34 +151,31 @@ export default function SitesTab() {
     await persistScope('global');
   }
 
-  async function disableGlobal() {
-    await persistScope('list');
-    await chrome.permissions.remove({ origins: ['*://*/*'] }).catch(() => {});
-    setGlobalGranted(false);
-    setNotice('');
-  }
-
   async function persistExcludeHosts(next: string[]) {
     setExcludeHosts(next);
     const settings = await getSettings();
     if (!settings) return;
     settings.excludeHosts = next;
     await saveSettings(settings);
+    // 保存后 content script 会因 storage 变更自动刷新判定，无需再注册
   }
 
-  function addExclude() {
-    const host = newExclude.trim().toLowerCase();
-    if (!isValidHostPattern(host)) {
-      setNotice(t.options.invalidDomain);
-      return;
+  /** 停止输入 500ms 后落盘；失焦时立即落盘 */
+  function scheduleExcludeCommit(text: string) {
+    if (excludeTimer.current) window.clearTimeout(excludeTimer.current);
+    excludeTimer.current = window.setTimeout(() => {
+      void persistExcludeHosts(parseExcludeText(text));
+    }, 500);
+  }
+
+  function commitExcludeText(text: string) {
+    if (excludeTimer.current) {
+      window.clearTimeout(excludeTimer.current);
+      excludeTimer.current = null;
     }
-    if (excludeHosts.includes(host)) {
-      setNewExclude('');
-      return;
-    }
-    void persistExcludeHosts([...excludeHosts, host]);
-    setNewExclude('');
-    setNotice('');
+    const next = parseExcludeText(text);
+    if (next.join('\n') === excludeHosts.join('\n')) return;
+    void persistExcludeHosts(next);
   }
 
   /** 单个站点启停（状态列点击）：启用申请权限，停用交还权限 */
@@ -367,7 +401,7 @@ export default function SitesTab() {
 
   return (
     <div className="space-y-5">
-      {/* 作用范围切换 */}
+      {/* 情景模式切换：选中项标题高亮 + 生效图标 */}
       <section>
         <h3 className="mb-2 text-sm font-semibold">{t.options.scopeTitle}</h3>
         <div className="grid gap-2 sm:grid-cols-2">
@@ -377,10 +411,34 @@ export default function SitesTab() {
                 ? 'border-black bg-neutral-50'
                 : 'border-[var(--vesper-border)] bg-white hover:border-neutral-400'
             }`}
-            onClick={() => scope !== 'global' && void enableGlobal()}
+            onClick={() => {
+              if (scope !== 'global' || !globalGranted) void enableGlobal();
+            }}
           >
-            <div className="font-medium">{t.options.scopeGlobal}</div>
-            <div className="mt-1 text-xs text-[var(--vesper-text-dim)]">{t.options.scopeGlobalDesc}</div>
+            <div className="flex items-center">
+              <span
+                className={
+                  scope === 'global'
+                    ? 'font-semibold text-black'
+                    : 'font-medium text-[var(--vesper-text-dim)]'
+                }
+              >
+                {t.options.scopeGlobal}
+              </span>
+              {scope === 'global' && globalGranted && (
+                <span className="ml-auto">
+                  <ActiveBadge title={t.options.scopeActive} />
+                </span>
+              )}
+            </div>
+            <div className="mt-1 text-xs text-[var(--vesper-text-dim)]">
+              {t.options.scopeGlobalDesc}
+            </div>
+            {scope === 'global' && !globalGranted && (
+              <span className="mt-1 block text-[11px] text-neutral-600">
+                {t.options.scopeGlobalNeedGrant}
+              </span>
+            )}
           </button>
           <button
             className={`rounded-lg border p-3 text-left text-sm ${
@@ -390,8 +448,25 @@ export default function SitesTab() {
             }`}
             onClick={() => scope !== 'list' && void persistScope('list')}
           >
-            <div className="font-medium">{t.options.scopeList}</div>
-            <div className="mt-1 text-xs text-[var(--vesper-text-dim)]">{t.options.scopeListDesc}</div>
+            <div className="flex items-center">
+              <span
+                className={
+                  scope === 'list'
+                    ? 'font-semibold text-black'
+                    : 'font-medium text-[var(--vesper-text-dim)]'
+                }
+              >
+                {t.options.scopeList}
+              </span>
+              {scope === 'list' && (
+                <span className="ml-auto">
+                  <ActiveBadge title={t.options.scopeActive} />
+                </span>
+              )}
+            </div>
+            <div className="mt-1 text-xs text-[var(--vesper-text-dim)]">
+              {t.options.scopeListDesc}
+            </div>
           </button>
         </div>
       </section>
@@ -399,61 +474,24 @@ export default function SitesTab() {
       {notice && <div className="text-sm text-neutral-600">{notice}</div>}
 
       {scope === 'global' ? (
-        /* 全局模式：权限状态 + 例外名单 */
-        <section className="space-y-3">
-          <div className="rounded-lg border border-[var(--vesper-border)] bg-[#ffffff] p-3">
-            <div className="flex items-center justify-between">
-              <span className="text-sm font-medium">
-                {globalGranted ? t.options.scopeGlobalGranted : t.options.scopeGlobalGrant}
-              </span>
-              <Toggle
-                checked={globalGranted}
-                onChange={(v) => (v ? void enableGlobal() : void disableGlobal())}
-              />
-            </div>
-            <p className="mt-2 text-xs text-[var(--vesper-text-dim)]">{t.options.globalPermissionHint}</p>
-          </div>
-
-          <div>
-            <h4 className="mb-1 text-sm font-medium">{t.options.excludeListTitle}</h4>
-            <p className="mb-2 text-xs text-[var(--vesper-text-dim)]">{t.options.excludeListHint}</p>
-            <div className="mb-3 flex gap-2">
-              <input
-                className="min-w-0 flex-1 rounded-md border border-[var(--vesper-border)] bg-white px-3 py-2 text-sm"
-                placeholder={t.options.excludeEmpty}
-                value={newExclude}
-                onChange={(e) => setNewExclude(e.target.value)}
-                onKeyDown={(e) => {
-                  if (e.key === 'Enter') addExclude();
-                }}
-              />
-              <button
-                className={`rounded-md px-4 py-2 text-sm font-medium text-white ${
-                  newExclude.trim() ? 'bg-black hover:brightness-150' : 'cursor-not-allowed bg-neutral-300'
-                }`}
-                onClick={addExclude}
-              >
-                {t.options.addExclude}
-              </button>
-            </div>
-            <div className="space-y-1">
-              {excludeHosts.length === 0 && <div className="text-xs text-[var(--vesper-text-dim)]">—</div>}
-              {excludeHosts.map((host) => (
-                <div
-                  key={host}
-                  className="flex items-center gap-2 rounded border border-[var(--vesper-border)] bg-white px-3 py-1.5 text-sm"
-                >
-                  <span className="font-mono text-xs">{host}</span>
-                  <button
-                    className="ml-auto text-xs text-neutral-500 hover:text-black"
-                    onClick={() => void persistExcludeHosts(excludeHosts.filter((h) => h !== host))}
-                  >
-                    {t.common.delete}
-                  </button>
-                </div>
-              ))}
-            </div>
-          </div>
+        /* 全局模式：例外主机（多行文本框，每行一条） */
+        <section>
+          <h4 className="mb-1 text-sm font-medium">{t.options.excludeListTitle}</h4>
+          <p className="mb-1 text-xs text-[var(--vesper-text-dim)]">{t.options.excludeListHint}</p>
+          <p className="mb-2 text-[11px] text-[var(--vesper-text-dim)]">
+            {t.options.excludeListTip}
+          </p>
+          <textarea
+            className="h-44 w-full resize-y rounded-md border border-[var(--vesper-border)] bg-white px-3 py-2 font-mono text-xs leading-5 outline-none focus:border-black"
+            value={excludeText}
+            onChange={(e) => {
+              setExcludeText(e.target.value);
+              scheduleExcludeCommit(e.target.value);
+            }}
+            onBlur={() => commitExcludeText(excludeText)}
+            spellCheck={false}
+            placeholder={t.options.excludeEmpty}
+          />
         </section>
       ) : (
         /* list（黑名单）模式：顶部筛选 + 添加按钮 + 批量操作 + 行式表格 */
