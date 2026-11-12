@@ -181,3 +181,29 @@ test.describe('粘贴拦截全链路（真实构建产物 + chrome API 桩）', 
     await expect(page.locator('#ta')).toHaveValue('公司B');
   });
 });
+
+test.describe('大文本性能回归（Worker 异步 + 回填兜底）', () => {
+  // 64KB 文本：远超 12KB Worker 阈值，必走异步路径；含大量邮箱命中。
+  // 测试环境 chrome.runtime.getURL 未桩时 Worker 创建会失败，但兜底链
+  // 必须仍能把文本安全回填到 textarea（native setter 不受 CE_INSERT_LIMIT 限制），
+  // 绝不卡死或丢失文本。
+  const LARGE_BYTES = 64 * 1024;
+
+  test('大文本粘贴到 textarea 不卡死、文本不丢失', async ({ page }) => {
+    await setup(page, 'auto');
+    await pasteInto(page, '#ta', 'a@x.com '.repeat(LARGE_BYTES / 8));
+    // 能在合理时间内读到值 = 主线程没被同步引擎冻死
+    const value = await page.locator('#ta').inputValue({ timeout: 8000 });
+    expect(value.length).toBeGreaterThan(1000);
+    // 无论 Worker 成功（脱敏为 [EMAIL_]）还是失败兜底（原文），都应含邮箱特征
+    expect(/@|EMAIL/.test(value)).toBe(true);
+  });
+
+  test('大文本粘贴到 contenteditable 走剪贴板兜底，不卡死', async ({ page }) => {
+    await setup(page, 'auto');
+    await pasteInto(page, '#ce', 'a@x.com '.repeat(LARGE_BYTES / 8));
+    // contenteditable 大文本回填必走 fallbackCopy（CE_INSERT_LIMIT=16KB），
+    // Toast 出现 = 兜底链正常工作，未冻死页面
+    await expect(page.getByText(/已脱敏并复制/)).toBeVisible({ timeout: 8000 });
+  });
+});

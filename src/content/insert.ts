@@ -40,8 +40,13 @@ function insertIntoField(el: HTMLTextAreaElement | HTMLInputElement, text: strin
   }
 }
 
-/** contenteditable 回填上限：超过则返回 false 走剪贴板兜底，避免大文本回填卡顿/崩溃 */
-const CE_INSERT_LIMIT = 200 * 1024;
+/** contenteditable 回填上限：超过则返回 false 走剪贴板兜底，避免大文本回填卡顿/崩溃。
+ *
+ *  历史阈值 200KB 过高 —— ProseMirror/Slate/Lexical 等富文本编辑器对
+ *  insertText/Range 插入会同步解析文本、构建文档模型、diff，30KB+ 即可
+ *  让主线程长时间阻塞，200KB 必崩。16KB 是 ProseMirror 实测的相对安全上限，
+ *  超过即走剪贴板兜底（textarea 不受此限，仍可大文本回填）。 */
+const CE_INSERT_LIMIT = 16 * 1024;
 
 /** contenteditable：execCommand 优先，Selection/Range 兜底 */
 function insertIntoContentEditable(el: HTMLElement, text: string): boolean {

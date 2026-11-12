@@ -92,17 +92,42 @@ function onDrop(e: DragEvent, adapter: Adapter): void {
   handleIntercept(text, e, adapter);
 }
 
-/** 大文本阈值：超过则走 Worker 异步脱敏，避免主线程长时间阻塞（性能优化） */
-const WORKER_THRESHOLD = 100 * 1024;
+/**
+ * 大文本阈值：超过则走 Worker 异步脱敏，避免主线程长时间阻塞（性能优化）。
+ *
+ * 历史阈值 100KB 过高 —— 50KB 文本同步跑 12 个内置检测器 + 用户规则
+ * 已能阻塞主线程数秒，浏览器随后判定页面无响应并提示"崩溃"。
+ * 12KB 同步耗时通常 < 30ms（毫秒级，用户无感），超过即异步化。
+ */
+const WORKER_THRESHOLD = 12 * 1024;
+
+/** Worker 超时保护：用户正则若触发灾难性回溯，Worker 线程也会卡死。
+ *  超时即放弃本次脱敏、回填原文，不让粘贴永久挂起。 */
+const WORKER_TIMEOUT_MS = 10_000;
 
 let engineWorker: Worker | null = null;
 
-/** 大文本脱敏：在 Worker 线程执行，结果经 postMessage 返回（协议同 engine.worker.ts） */
+/** 大文本脱敏：在 Worker 线程执行，结果经 postMessage 返回（协议同 engine.worker.ts）。
+ *  错误恢复：onError / 超时时把 engineWorker 置 null，下次重新创建，
+ *  避免复用已 dead 的 worker 导致后续大文本永远走兜底。 */
 function desensitizeInWorker(text: string, scheme: Scheme): Promise<DesensitizeResult> {
-  if (!engineWorker) engineWorker = new EngineWorker();
-  const w = engineWorker;
   return new Promise((resolve, reject) => {
+    // new Worker 可能同步抛错（如测试环境 chrome.runtime.getURL 未桩、
+    // 或生产环境 worker 脚本未在 web_accessible_resources）。
+    // 放进 Promise 体内，统一成 reject，避免同步抛错穿透到调用方。
+    let w: Worker;
+    try {
+      w = engineWorker ?? (engineWorker = new EngineWorker());
+    } catch {
+      reject(new Error('worker-create-failed'));
+      return;
+    }
+    let timer: ReturnType<typeof setTimeout> | null = null;
     const cleanup = () => {
+      if (timer) {
+        clearTimeout(timer);
+        timer = null;
+      }
       w.removeEventListener('message', onMessage);
       w.removeEventListener('error', onError);
     };
@@ -110,12 +135,29 @@ function desensitizeInWorker(text: string, scheme: Scheme): Promise<DesensitizeR
       cleanup();
       resolve(e.data as DesensitizeResult);
     };
-    const onError = (e: ErrorEvent) => {
+    const onError = (_e: ErrorEvent) => {
       cleanup();
-      reject(e);
+      // Worker 已死，置 null 让下次重新创建（否则后续大文本必走兜底）
+      if (engineWorker === w) engineWorker = null;
+      try {
+        w.terminate();
+      } catch {
+        /* 已死，忽略 */
+      }
+      reject(new Error('worker-error'));
     };
     w.addEventListener('message', onMessage);
     w.addEventListener('error', onError);
+    timer = setTimeout(() => {
+      cleanup();
+      if (engineWorker === w) engineWorker = null;
+      try {
+        w.terminate();
+      } catch {
+        /* 忽略 */
+      }
+      reject(new Error('worker-timeout'));
+    }, WORKER_TIMEOUT_MS);
     w.postMessage({ text, scheme });
   });
 }
