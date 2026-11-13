@@ -310,7 +310,7 @@ export default defineBackground(() => {
             if (!granted) return { status: 'no-permission' } satisfies SiteStateResponse;
             const scheme = await getActiveScheme();
             if (!scheme) return { status: 'disabled' } satisfies SiteStateResponse;
-            // 全局模式无具体站点，构造虚拟站点（默认预览模式）；scheme 用当前方案
+            // 全局模式无具体站点，构造虚拟站点（拦截模式跟随用户配置）；scheme 用当前方案
             return {
               status: 'enabled',
               site: {
@@ -318,7 +318,7 @@ export default defineBackground(() => {
                 host: '',
                 schemeId: '',
                 enabled: true,
-                mode: 'preview',
+                mode: settings?.globalMode ?? 'preview',
               },
               scheme,
             } satisfies SiteStateResponse;

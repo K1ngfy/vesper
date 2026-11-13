@@ -225,7 +225,15 @@ async function runLargeText(
   dispatchByMode(target, res, text, adapter, mode);
 }
 
-/** 按站点拦截模式分发处理（warn-only / auto / preview） */
+/** 按站点拦截模式分发处理（warn-only / auto / preview）。
+ *
+ * 回填异步化（v0.2.4）：auto / warn-only 模式的 insertText 在 paste 事件同步
+ * 上下文中执行时，execCommand('insertText') 可能因焦点/选区状态不稳定而返回
+ * false（paste 被 preventDefault 后浏览器内部状态处于中间态）。改为 setTimeout(0)
+ * 延迟到下一个事件循环执行，此时焦点已稳定，execCommand 成功率大幅提升，
+ * 减少"回填失败 → 剪贴板兜底"的触发频率。
+ * preview 模式同步显示弹窗（用户需立即看到反馈），onConfirm 回调本身已是
+ * 异步用户手势上下文，无需再延迟。 */
 function dispatchByMode(
   target: HTMLElement,
   res: DesensitizeResult,
@@ -235,16 +243,17 @@ function dispatchByMode(
 ): void {
   try {
     if (mode === 'warn-only') {
-      // 仅提醒：放行原文（手动补一次默认粘贴，因为我们已 preventDefault）
-      insertOriginal(target, original, adapter);
+      // 仅提醒：放行原文（异步回填，避免同步上下文焦点不稳定）
+      scheduleInsert(() => insertOriginal(target, original, adapter));
       showToast(t.content.toastWarn(res.hits.length));
       return;
     }
     if (mode === 'auto') {
-      applyDesensitized(target, res, original, adapter);
+      // 自动替换：异步回填脱敏结果
+      scheduleInsert(() => applyDesensitized(target, res, original, adapter));
       return;
     }
-    // 默认：预览确认
+    // 默认：预览确认（同步显示弹窗，onConfirm 时已是异步用户手势）
     showPreview(res, {
       onConfirm: () => applyDesensitized(target, res, original, adapter),
       onPasteOriginal: () => insertOriginal(target, original, adapter),
@@ -257,6 +266,11 @@ function dispatchByMode(
     insertOriginal(target, original, adapter);
     showToast(t.content.previewFailed);
   }
+}
+
+/** 延迟到下一个事件循环执行回填（脱离 paste 同步上下文，焦点更稳定） */
+function scheduleInsert(fn: () => void): void {
+  setTimeout(fn, 0);
 }
 
 /** 回填原文（warn-only / 用户选择粘贴原文） */
@@ -289,10 +303,41 @@ function applyDesensitized(
   }
 }
 
-/** 兜底：写入剪贴板，任何情况下不让用户丢文本（文档 4.6） */
+/** 兜底：写入剪贴板，任何情况下不让用户丢文本（文档 4.6）。
+ *
+ * 两级策略确保可靠（v0.2.4 修复"已复制但剪贴板为空"）：
+ * 1. 临时 textarea + execCommand('copy')（同步，不依赖 user activation，
+ *    clipboardWrite 权限保障）—— paste 回调中 navigator.clipboard.writeText
+ *    是异步的，用户手势可能在 Promise resolve 时已过期导致写入失败；
+ *    execCommand('copy') 在选中态下同步完成，无此问题。
+ * 2. navigator.clipboard.writeText（备选，execCommand 被 CSP 限制时兜底）。
+ *
+ * 关键修复：旧实现 catch 分支也显示"已复制"，clipboard 写入失败时误导用户
+ * 以为剪贴板有内容 → "没有可以复制的内容"。现在失败明确提示。 */
 function fallbackCopy(text: string): void {
+  // 主路径：临时 textarea + execCommand('copy')
+  let ok = false;
+  try {
+    const ta = document.createElement('textarea');
+    ta.value = text;
+    ta.setAttribute('data-vesper-ui', '1');
+    ta.style.cssText =
+      'position:fixed;top:0;left:0;width:1px;height:1px;opacity:0;border:0;padding:0;';
+    document.documentElement.appendChild(ta);
+    ta.focus();
+    ta.select();
+    ok = document.execCommand('copy');
+    ta.remove();
+  } catch {
+    ok = false;
+  }
+  if (ok) {
+    showToast(t.content.fallbackCopied);
+    return;
+  }
+  // 备选：异步 clipboard API（部分站点 execCommand 被 CSP 限制时）
   void navigator.clipboard
     .writeText(text)
     .then(() => showToast(t.content.fallbackCopied))
-    .catch(() => showToast(t.content.fallbackCopied));
+    .catch(() => showToast(t.content.fallbackFailed));
 }

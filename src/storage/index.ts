@@ -21,7 +21,7 @@ import {
   PRESET_HOST_CATEGORY,
   PRESET_SITES,
 } from '../core/presets';
-import type { Scheme, SiteRule, SiteScope } from '../core/types';
+import type { Scheme, SiteMode, SiteRule, SiteScope } from '../core/types';
 
 export interface Settings {
   globalEnabled: boolean;
@@ -32,6 +32,8 @@ export interface Settings {
   persistMappings: boolean;
   /** 站点作用范围（文档 4.4）：'list' 名单模式（默认）/ 'global' 全局模式 */
   siteScope: SiteScope;
+  /** 全局模式下的拦截模式（文档 4.4）；list 模式下各站点独立配置 mode */
+  globalMode: SiteMode;
   /** 全局模式下的排除名单（域名数组）；list 模式下忽略 */
   excludeHosts: string[];
 }
@@ -68,7 +70,7 @@ async function set(key: string, value: unknown): Promise<void> {
  */
 export const FOLLOW_ACTIVE_SCHEME = '';
 
-const SCHEMA_VERSION = 7;
+const SCHEMA_VERSION = 8;
 
 /** 首次安装播种：默认方案 + 预置站点（未启用）+ 默认设置；含 schema 版本标记 */
 export async function ensureSeeded(): Promise<void> {
@@ -95,6 +97,7 @@ export async function ensureSeeded(): Promise<void> {
       dailyCount: { date: today(), count: 0 },
       persistMappings: false,
       siteScope: 'list',
+      globalMode: 'preview',
       excludeHosts: [...DEFAULT_EXCLUDE_HOSTS],
     } satisfies Settings);
   }
@@ -163,6 +166,15 @@ export async function ensureSeeded(): Promise<void> {
     const current = await get<Settings>(KEYS.settings);
     if (current && (!current.excludeHosts || current.excludeHosts.length === 0)) {
       await set(KEYS.settings, { ...current, excludeHosts: [...DEFAULT_EXCLUDE_HOSTS] });
+    }
+  }
+
+  // v8 迁移：Settings 补 globalMode 字段（全局模式拦截模式，默认 preview）。
+  // 老用户升级时若缺该字段则写入默认值，使全局模式可配置拦截模式。
+  if ((meta?.schemaVersion ?? 0) < 8) {
+    const current = await get<Settings>(KEYS.settings);
+    if (current && !current.globalMode) {
+      await set(KEYS.settings, { ...current, globalMode: 'preview' });
     }
   }
 
@@ -377,6 +389,7 @@ export async function exportAll(): Promise<ExportBundle> {
       activeSchemeId: settings?.activeSchemeId ?? '',
       persistMappings: settings?.persistMappings ?? false,
       siteScope: settings?.siteScope ?? 'list',
+      globalMode: settings?.globalMode ?? 'preview',
       excludeHosts: settings?.excludeHosts ?? [],
     },
   };
@@ -425,6 +438,8 @@ export async function importAll(bundle: ExportBundle): Promise<void> {
   const current = await getSettings();
   await saveSettings({
     ...bundle.settings,
+    // 兼容老版本导出文件（无 globalMode 字段时补默认值）
+    globalMode: bundle.settings.globalMode ?? 'preview',
     dailyCount: current?.dailyCount ?? { date: today(), count: 0 },
   });
 }

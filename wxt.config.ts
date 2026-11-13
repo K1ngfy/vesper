@@ -11,6 +11,9 @@ import tailwindcss from '@tailwindcss/vite';
  * - scripting：按"已启用且已授权"的站点动态注册 content script（D5 最小权限的
  *   实现手段；文档第 7 节未列出，属文档未覆盖细节，按最小权限原则补充）。
  * - activeTab：Popup 显示"当前标签页站点拦截状态"时读取活动标签 URL。
+ * - clipboardWrite：insertText 回填失败时把脱敏结果写入剪贴板兜底（文档 4.6 护栏：
+ *   任何情况下不让用户丢失文本）。异步 navigator.clipboard.writeText 在 content script
+ *   非用户手势上下文会失败，此权限确保剪贴板兜底链可靠。
  * - optional_host_permissions（全主机通配）：默认按域名逐个申请；
  *   用户主动开启全局模式时可申请全局通配权限整体授权（D5 修订）。
  *
@@ -25,7 +28,7 @@ export default defineConfig({
     name: 'VESPER',
     description:
       '粘贴之前，先过一遍暮星。在文本进入 AI 平台前，于本机完成敏感信息脱敏。零服务器、零上传、零统计。',
-    permissions: ['storage', 'contextMenus', 'sidePanel', 'scripting', 'activeTab'],
+    permissions: ['storage', 'contextMenus', 'sidePanel', 'scripting', 'activeTab', 'clipboardWrite'],
     optional_host_permissions: ['*://*/*'],
     commands: {
       'open-workbench': {

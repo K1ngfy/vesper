@@ -124,6 +124,8 @@ export const zhCN = {
     excludeListTip:
       '支持通配符与网段：*.example.com 匹配根域及其所有子域，* 匹配全部；192.168.0.0/16 为 IPv4 网段；IPv6 写成 [::1]',
     excludeEmpty: '每行一个主机，如 127.0.0.1',
+    globalModeTitle: '拦截模式',
+    globalModeHint: '全局拦截所有站点时，遇到敏感信息的处理方式',
     selectorAdvanced: '高级：自定义输入框定位',
     selectorHelp:
       '当某站点的输入框无法被自动识别时可使用。VESPER 会用 el.closest(选择器) 命中的元素作为拦截目标，选择器需匹配输入框本身或其包含元素。',
@@ -179,6 +181,7 @@ export const zhCN = {
     pasteOriginalConfirm: '确认粘贴未脱敏的原文？',
     btnCancel: '取消',
     fallbackCopied: '已脱敏并复制，请按 Ctrl+V 粘贴',
+    fallbackFailed: '脱敏完成但写入剪贴板失败，请重试粘贴',
     previewFailed: '预览未能显示，已按原文粘贴（可改用工作台脱敏）',
   },
 } as const;

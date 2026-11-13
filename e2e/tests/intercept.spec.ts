@@ -52,6 +52,10 @@ async function setup(
   page: import('@playwright/test').Page,
   mode: 'auto' | 'preview' | 'warn-only',
 ) {
+  // fallbackCopy 用 execCommand('copy') + navigator.clipboard.writeText 两级兜底；
+  // headless 下 execCommand('copy') 常返回 false，需 clipboard-write 权限让
+  // navigator.clipboard.writeText 兜底成功，否则大文本测试会误报"复制失败"。
+  await page.context().grantPermissions(['clipboard-write']);
   await page.addInitScript((state) => {
     // chrome API 桩：GET_SITE_STATE 返回可变状态；onChanged 监听器可被测试触发
     const w = window as unknown as {

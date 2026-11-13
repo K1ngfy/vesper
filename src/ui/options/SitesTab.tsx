@@ -100,6 +100,7 @@ export default function SitesTab() {
   const [excludeText, setExcludeText] = useState('');
   const excludeTimer = useRef<number | null>(null);
   const [globalGranted, setGlobalGranted] = useState(false);
+  const [globalMode, setGlobalMode] = useState<SiteMode>('preview');
   const [notice, setNotice] = useState('');
   const [expanded, setExpanded] = useState<Record<string, boolean>>({});
   const [filter, setFilter] = useState<Filter>('all');
@@ -118,6 +119,7 @@ export default function SitesTab() {
       setSites(s);
       setSchemes(sch);
       setScope(st?.siteScope ?? 'list');
+      setGlobalMode(st?.globalMode ?? 'preview');
       const exclude = st?.excludeHosts ?? DEFAULT_EXCLUDE_HOSTS;
       setExcludeHosts(exclude);
       setExcludeText(exclude.join('\n'));
@@ -158,6 +160,15 @@ export default function SitesTab() {
     settings.excludeHosts = next;
     await saveSettings(settings);
     // 保存后 content script 会因 storage 变更自动刷新判定，无需再注册
+  }
+
+  /** 全局模式拦截模式变更：写入 settings，content script 监听 storage 变化自动刷新 */
+  async function persistGlobalMode(next: SiteMode) {
+    setGlobalMode(next);
+    const settings = await getSettings();
+    if (!settings) return;
+    settings.globalMode = next;
+    await saveSettings(settings);
   }
 
   /** 停止输入 500ms 后落盘；失焦时立即落盘 */
@@ -474,24 +485,41 @@ export default function SitesTab() {
       {notice && <div className="text-sm text-neutral-600">{notice}</div>}
 
       {scope === 'global' ? (
-        /* 全局模式：例外主机（多行文本框，每行一条） */
-        <section>
-          <h4 className="mb-1 text-sm font-medium">{t.options.excludeListTitle}</h4>
-          <p className="mb-1 text-xs text-[var(--vesper-text-dim)]">{t.options.excludeListHint}</p>
-          <p className="mb-2 text-[11px] text-[var(--vesper-text-dim)]">
-            {t.options.excludeListTip}
-          </p>
-          <textarea
-            className="h-44 w-full resize-y rounded-md border border-[var(--vesper-border)] bg-white px-3 py-2 font-mono text-xs leading-5 outline-none focus:border-black"
-            value={excludeText}
-            onChange={(e) => {
-              setExcludeText(e.target.value);
-              scheduleExcludeCommit(e.target.value);
-            }}
-            onBlur={() => commitExcludeText(excludeText)}
-            spellCheck={false}
-            placeholder={t.options.excludeEmpty}
-          />
+        /* 全局模式：拦截模式 + 例外主机（多行文本框，每行一条） */
+        <section className="space-y-4">
+          {/* 拦截模式 */}
+          <div>
+            <h4 className="mb-1 text-sm font-medium">{t.options.globalModeTitle}</h4>
+            <p className="mb-2 text-xs text-[var(--vesper-text-dim)]">{t.options.globalModeHint}</p>
+            <select
+              className="w-full max-w-xs rounded-md border border-[var(--vesper-border)] bg-white px-3 py-2 text-sm"
+              value={globalMode}
+              onChange={(e) => void persistGlobalMode(e.target.value as SiteMode)}
+            >
+              <option value="preview">{t.options.modePreview}</option>
+              <option value="auto">{t.options.modeAuto}</option>
+              <option value="warn-only">{t.options.modeWarnOnly}</option>
+            </select>
+          </div>
+          {/* 例外主机 */}
+          <div>
+            <h4 className="mb-1 text-sm font-medium">{t.options.excludeListTitle}</h4>
+            <p className="mb-1 text-xs text-[var(--vesper-text-dim)]">{t.options.excludeListHint}</p>
+            <p className="mb-2 text-[11px] text-[var(--vesper-text-dim)]">
+              {t.options.excludeListTip}
+            </p>
+            <textarea
+              className="h-44 w-full resize-y rounded-md border border-[var(--vesper-border)] bg-white px-3 py-2 font-mono text-xs leading-5 outline-none focus:border-black"
+              value={excludeText}
+              onChange={(e) => {
+                setExcludeText(e.target.value);
+                scheduleExcludeCommit(e.target.value);
+              }}
+              onBlur={() => commitExcludeText(excludeText)}
+              spellCheck={false}
+              placeholder={t.options.excludeEmpty}
+            />
+          </div>
         </section>
       ) : (
         /* list（黑名单）模式：顶部筛选 + 添加按钮 + 批量操作 + 行式表格 */
