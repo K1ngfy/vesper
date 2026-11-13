@@ -16,7 +16,7 @@ import type { BuiltinDetectorId, Rule, Scheme, SiteCategory, SiteRule } from './
  * 用于跨"是否带通配前缀"的统一比较与查找（*.chatgpt.com ≡ chatgpt.com）。
  */
 export function normalizeHost(host: string): string {
-  const v = host.trim().toLowerCase();
+  const v = host.trim().toLowerCase().replace(/\.$/, '');
   return v.startsWith('*.') ? v.slice(2) : v;
 }
 

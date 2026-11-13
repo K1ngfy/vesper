@@ -3,22 +3,22 @@
  * 同时被 workbench 页与 side panel 复用。
  *
  * 行为要点：
- * - 输入即脱敏（防抖 150ms）；>500KB 走 Web Worker。
+ * - 输入即脱敏（防抖 150ms）；大文本和自定义正则走 Web Worker。
  * - 结果区高亮被替换片段，悬停显示原值与命中规则名（原值仅本地显示）。
  * - 还原模式：映射仅保存于本组件内存（session 级），关闭页面即销毁；
  *   同时上报 background（仅当用户在设置中开启本地保留时才落盘）。
  */
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { desensitize } from '../core/engine';
 import { restoreWithMarks } from '../core/restore';
-import type { DesensitizeResult, Hit, Scheme } from '../core/types';
+import type { DesensitizeResult, Scheme } from '../core/types';
 import { sendMessage } from '../messages';
-import { getMappings, getSettings } from '../storage';
+import { getLastMapping, getMappings, getSettings } from '../storage';
 import { t } from '../i18n';
-// vite 环境类型（vite/client，WXT 已引入）声明了 ?worker 模块导出
-import EngineWorker from '../core/engine.worker?worker';
+import { startEngineJob } from '../core/worker-job';
 
-const WORKER_THRESHOLD = 500 * 1024; // 500KB
+const WORKER_THRESHOLD = 12 * 1024;
+const HIGHLIGHT_LIMIT = 500;
 const MAX_FILE_SIZE = 10 * 1024 * 1024; // 10MB
 const FILE_EXTS = ['.txt', '.log', '.md', '.json', '.csv'];
 
@@ -28,7 +28,11 @@ export default function WorkbenchApp() {
   const [schemes, setSchemes] = useState<Scheme[]>([]);
   const [schemeId, setSchemeId] = useState('');
   const [input, setInput] = useState('');
-  const [res, setRes] = useState<DesensitizeResult | null>(null);
+  const [completed, setCompleted] = useState<{
+    input: string;
+    scheme: Scheme;
+    result: DesensitizeResult;
+  } | null>(null);
   const [mode, setMode] = useState<Mode>('desensitize');
   const [restoreInput, setRestoreInput] = useState('');
   const [notice, setNotice] = useState('');
@@ -38,14 +42,16 @@ export default function WorkbenchApp() {
   // useMemo 能正确重算——之前用 ref 时映射变化不触发重渲染，还原模式拿到的
   // 是旧值，且重开工作台后映射恒空，导致"还原模式没反应"。
   const [lastMapping, setLastMapping] = useState<Record<string, string>>({});
-  const debounceTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
-  const workerRef = useRef<Worker | null>(null);
+
   const resultRef = useRef<HTMLDivElement>(null);
 
   const scheme = useMemo(
     () => schemes.find((s) => s.id === schemeId) ?? schemes[0],
     [schemes, schemeId],
   );
+
+  const res =
+    completed && completed.input === input && completed.scheme === scheme ? completed.result : null;
 
   // 初始化：取方案列表 + 右键菜单带入的文本 + （开启本地保留时）恢复最近映射
   useEffect(() => {
@@ -56,13 +62,11 @@ export default function WorkbenchApp() {
       if (active) setSchemeId(active.id);
       // 若用户在设置中开启了"保存映射到本地"，恢复最近一次映射，
       // 否则重开工作台后还原模式恒空映射、无法还原。
-      const settings = await getSettings();
-      if (settings?.persistMappings) {
-        const recs = await getMappings();
-        if (recs[0]?.mapping && Object.keys(recs[0].mapping).length > 0) {
-          setLastMapping(recs[0].mapping);
-        }
-      }
+      const [last, settings] = await Promise.all([getLastMapping(), getSettings()]);
+      const mapping =
+        last?.mapping ??
+        (settings?.persistMappings ? (await getMappings())[0]?.mapping : undefined);
+      if (mapping) setLastMapping(mapping);
       const pending = await chrome.storage.session.get('vesper:pendingInput');
       const text = pending['vesper:pendingInput'];
       if (typeof text === 'string' && text) {
@@ -70,50 +74,44 @@ export default function WorkbenchApp() {
         await chrome.storage.session.remove('vesper:pendingInput');
       }
     })();
-    return () => workerRef.current?.terminate();
   }, []);
 
-  const runEngine = useCallback((text: string, sch: Scheme) => {
-    if (!text) {
-      setRes(null);
-      return;
-    }
-    if (text.length > WORKER_THRESHOLD) {
-      workerRef.current?.terminate();
-      const w: Worker = new EngineWorker();
-      workerRef.current = w;
-      w.onmessage = (e: MessageEvent<DesensitizeResult>) => {
-        applyResult(e.data, sch);
-        w.terminate();
-      };
-      w.postMessage({ text, scheme: sch });
-    } else {
-      applyResult(desensitize(text, sch), sch);
-    }
-  }, []);
-
-  function applyResult(r: DesensitizeResult, sch: Scheme) {
-    setRes(r);
-    if (Object.keys(r.mapping).length > 0) {
-      setLastMapping(r.mapping);
-      void sendMessage({ type: 'RECORD_MAPPING', schemeId: sch.id, mapping: r.mapping });
-    }
-  }
-
-  // 输入即脱敏，防抖 150ms
   useEffect(() => {
-    if (!scheme) return;
-    clearTimeout(debounceTimer.current);
-    debounceTimer.current = setTimeout(() => runEngine(input, scheme), 150);
-    return () => clearTimeout(debounceTimer.current);
-  }, [input, scheme, runEngine]);
+    if (!scheme || !input) return;
+    let cancelled = false;
+    let job: ReturnType<typeof startEngineJob> | undefined;
+    const timer = setTimeout(async () => {
+      try {
+        const asyncEngine =
+          input.length >= WORKER_THRESHOLD ||
+          scheme.rules.some((rule) => rule.enabled && rule.type === 'regex');
+        if (asyncEngine) job = startEngineJob(input, scheme);
+        const result = job ? await job.result : desensitize(input, scheme, true);
+        if (cancelled) return;
+        setCompleted({ input, scheme, result });
+        if (Object.keys(result.mapping).length > 0) {
+          setLastMapping(result.mapping);
+          void sendMessage({
+            type: 'RECORD_MAPPING',
+            schemeId: scheme.id,
+            mapping: result.mapping,
+          }).catch(() => {});
+        }
+      } catch {
+        if (!cancelled) setNotice('脱敏未完成，请检查规则或缩短文本后重试。');
+      }
+    }, 150);
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+      job?.cancel();
+    };
+  }, [input, scheme]);
 
   // 还原结果：output 为纯文本（供复制），marks 标记每个被还原片段位置（供高亮）
   const restoreResult = useMemo(
     () =>
-      mode === 'restore'
-        ? restoreWithMarks(restoreInput, lastMapping)
-        : { output: '', marks: [] },
+      mode === 'restore' ? restoreWithMarks(restoreInput, lastMapping) : { output: '', marks: [] },
     [mode, restoreInput, lastMapping],
   );
   const restoreOutput = restoreResult.output;
@@ -140,22 +138,28 @@ export default function WorkbenchApp() {
     }
     const reader = new FileReader();
     reader.onload = () => setInput(String(reader.result ?? ''));
+    reader.onerror = () => setNotice('读取文件失败');
     reader.readAsText(file);
   }
 
   /** 命中清单聚合：规则名 × 次数，点击定位到首个高亮 */
   const hitGroups = useMemo(() => {
-    const map = new Map<string, { name: string; hits: Hit[] }>();
+    const map = new Map<string, { id: string; name: string; count: number }>();
     for (const h of res?.hits ?? []) {
-      const g = map.get(h.ruleId) ?? { name: h.ruleName, hits: [] };
-      g.hits.push(h);
+      const g = map.get(h.ruleId) ?? { id: h.ruleId, name: h.ruleName, count: 0 };
+      g.count += 1;
       map.set(h.ruleId, g);
     }
     return [...map.values()];
   }, [res]);
 
+  const highlightedRuleIds = useMemo(
+    () => new Set(res?.hits.slice(0, HIGHLIGHT_LIMIT).map((hit) => hit.ruleId)),
+    [res],
+  );
+
   function locateHit(ruleId: string) {
-    const el = resultRef.current?.querySelector(`[data-rule="${ruleId}"]`);
+    const el = resultRef.current?.querySelector(`[data-rule="${CSS.escape(ruleId)}"]`);
     el?.scrollIntoView({ behavior: 'smooth', block: 'center' });
   }
 
@@ -164,7 +168,7 @@ export default function WorkbenchApp() {
     if (!res) return null;
     const parts: React.ReactNode[] = [];
     let cursor = 0;
-    res.hits.forEach((h, i) => {
+    res.hits.slice(0, HIGHLIGHT_LIMIT).forEach((h, i) => {
       if (h.index > cursor) parts.push(res.output.slice(cursor, h.index));
       parts.push(
         <mark
@@ -188,7 +192,7 @@ export default function WorkbenchApp() {
     if (marks.length === 0) return output;
     const parts: React.ReactNode[] = [];
     let cursor = 0;
-    marks.forEach((mk, i) => {
+    marks.slice(0, HIGHLIGHT_LIMIT).forEach((mk, i) => {
       if (mk.index > cursor) parts.push(output.slice(cursor, mk.index));
       parts.push(
         <mark key={i} className="vesper-mark" title={`${mk.placeholder} → ${mk.original}`}>
@@ -294,6 +298,7 @@ export default function WorkbenchApp() {
               <span>{t.workbench.result}</span>
               <button
                 className="ml-auto rounded border border-[var(--vesper-border)] px-2 py-0.5 hover:border-[var(--vesper-accent)]"
+                disabled={!res}
                 onClick={() => res && copyText(res.output)}
               >
                 {t.workbench.copyResult}
@@ -313,11 +318,12 @@ export default function WorkbenchApp() {
                 <div className="flex flex-wrap gap-2">
                   {hitGroups.map((g) => (
                     <button
-                      key={g.name}
+                      key={g.id}
+                      disabled={!highlightedRuleIds.has(g.id)}
                       className="rounded-full border border-[var(--vesper-border)] px-2 py-0.5 text-xs hover:border-[var(--vesper-accent)]"
-                      onClick={() => locateHit(g.hits[0]!.ruleId)}
+                      onClick={() => locateHit(g.id)}
                     >
-                      {g.name} × {g.hits.length}
+                      {g.name} × {g.count}
                     </button>
                   ))}
                 </div>

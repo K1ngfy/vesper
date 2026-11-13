@@ -11,13 +11,13 @@ import type { Scheme, SiteRule, SiteScope } from '@/src/core/types';
 import { sendMessage, type SiteStateResponse } from '@/src/messages';
 import {
   getSettings,
-  saveSettings,
+  updateSettings,
   getSites,
   saveSites,
   hostToOrigins,
   urlToHost,
 } from '@/src/storage';
-import { genId } from '@/src/core/presets';
+import { genId, normalizeHost } from '@/src/core/presets';
 import { t } from '@/src/i18n';
 import Toggle from '@/src/ui/Toggle';
 
@@ -32,6 +32,7 @@ export default function App() {
   const [globalEnabled, setGlobalEnabled] = useState(true);
   const [schemes, setSchemes] = useState<Scheme[]>([]);
   const [schemeId, setSchemeId] = useState('');
+  const [activeHost, setActiveHost] = useState('');
   const [siteState, setSiteState] = useState<SiteStateResponse | null>(null);
   const [scope, setScope] = useState<SiteScope>('list');
   const [count, setCount] = useState(0);
@@ -39,9 +40,8 @@ export default function App() {
 
   async function refreshSiteState() {
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-    if (tab?.url) {
-      setSiteState(await sendMessage({ type: 'GET_SITE_STATE', url: tab.url }));
-    }
+    setActiveHost(urlToHost(tab?.url ?? ''));
+    setSiteState(tab?.url ? await sendMessage({ type: 'GET_SITE_STATE', url: tab.url }) : null);
   }
 
   useEffect(() => {
@@ -65,9 +65,9 @@ export default function App() {
   async function toggleGlobal() {
     const settings = await getSettings();
     if (!settings) return;
-    settings.globalEnabled = !settings.globalEnabled;
-    await saveSettings(settings);
-    setGlobalEnabled(settings.globalEnabled);
+    const enabled = !settings.globalEnabled;
+    await updateSettings({ globalEnabled: enabled });
+    setGlobalEnabled(enabled);
     // 状态行跟随刷新：关闭后当前站点应立即显示「已停用」
     await refreshSiteState();
   }
@@ -75,21 +75,20 @@ export default function App() {
   async function switchScheme(id: string) {
     setSchemeId(id);
     await sendMessage({ type: 'SET_ACTIVE_SCHEME', schemeId: id });
+    await refreshSiteState();
   }
 
   /** list 模式渐进授权：申请当前域名两条 origin 并加入名单启用 */
   async function enableCurrentSite() {
     setBusy(true);
     try {
-      const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-      if (!tab?.url) return;
-      const host = urlToHost(tab.url);
+      const host = activeHost;
       if (!host) return;
-      const origins = hostToOrigins(host);
+      const origins = hostToOrigins(siteState?.site?.host ?? host);
       const granted = await chrome.permissions.request({ origins });
       if (!granted) return;
       const sites = await getSites();
-      const existing = sites.find((s) => s.host === host);
+      const existing = siteState?.site ?? sites.find((s) => normalizeHost(s.host) === host);
       const next: SiteRule[] = existing
         ? sites.map((s) => (s.id === existing.id ? { ...s, enabled: true } : s))
         : [...sites, { id: genId(), host, schemeId: '', enabled: true, mode: 'preview' }];
@@ -107,12 +106,8 @@ export default function App() {
     try {
       const granted = await chrome.permissions.request({ origins: ['*://*/*'] });
       if (!granted) return;
-      const settings = await getSettings();
-      if (settings) {
-        settings.siteScope = 'global';
-        await saveSettings(settings);
-        setScope('global');
-      }
+      await updateSettings({ siteScope: 'global' });
+      setScope('global');
       await sendMessage({ type: 'REFRESH_SITE_REGISTRATIONS' });
       await refreshSiteState();
     } finally {
@@ -157,8 +152,17 @@ export default function App() {
   // 渐进授权按钮：list 模式下未配置/无权限可一键启用当前站点；
   // global 模式下无 *://*/* 权限可一键开启全局拦截。
   const canEnableHere =
-    scope === 'list' && (statusKey === 'unconfigured' || statusKey === 'no-permission');
-  const canEnableGlobal = scope === 'global' && statusKey === 'no-permission';
+    !!activeHost &&
+    scope === 'list' &&
+    (statusKey === 'unconfigured' || statusKey === 'no-permission');
+  const canEnableGlobal = !!activeHost && scope === 'global' && statusKey === 'no-permission';
+  const modeLabel =
+    siteState?.site &&
+    {
+      preview: t.options.modePreview,
+      auto: t.options.modeAuto,
+      'warn-only': t.options.modeWarnOnly,
+    }[siteState.site.mode];
   const showEnableButton = !busy && (canEnableHere || canEnableGlobal);
   const enableLabel = busy
     ? t.popup.enabling
@@ -204,7 +208,10 @@ export default function App() {
 
       <div className="mb-2 flex items-center justify-between rounded-md border border-[var(--vesper-border)] px-3 py-2 text-xs">
         <span className="text-[var(--vesper-text-dim)]">{t.popup.siteState}</span>
-        <span className={STATUS_CLS[statusKey]}>{statusText}</span>
+        <span className={STATUS_CLS[statusKey]}>
+          {statusText}
+          {statusKey === 'enabled' && modeLabel && ` · ${modeLabel}`}
+        </span>
       </div>
 
       {showEnableButton && (

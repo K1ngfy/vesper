@@ -1,11 +1,15 @@
-/**
- * 大文本脱敏 Worker（文档 4.3：>500KB 走 Web Worker 避免冻 UI）。
- * 经 vite `?worker` 引入，消息协议：{ text, scheme } → DesensitizeResult。
- */
-import { desensitize } from './engine';
+import { desensitize, testRule } from './engine';
+import type { Scheme } from './types';
 
-self.onmessage = (e: MessageEvent) => {
-  const { text, scheme } = e.data;
-  const res = desensitize(text, scheme);
-  self.postMessage(res);
+self.onmessage = ({ data }: MessageEvent<{ text: string; scheme: Scheme; validate: boolean }>) => {
+  try {
+    const { text, scheme, validate } = data;
+    const result =
+      validate && scheme.rules[0]
+        ? testRule(text, scheme.rules[0])
+        : desensitize(text, scheme, true);
+    self.postMessage({ result });
+  } catch (err) {
+    self.postMessage({ error: err instanceof Error ? err.message : 'engine-error' });
+  }
 };

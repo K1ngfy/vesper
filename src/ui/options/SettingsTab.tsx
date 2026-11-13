@@ -9,7 +9,7 @@ import {
   exportAll,
   getSettings,
   importAll,
-  saveSettings,
+  updateSettings,
   validateImport,
   type ExportBundle,
   type Settings,
@@ -30,7 +30,7 @@ export default function SettingsTab() {
     if (!settings) return;
     const next = { ...settings, ...patch };
     setSettings(next);
-    await saveSettings(next);
+    await updateSettings(patch);
   }
 
   async function onExport() {

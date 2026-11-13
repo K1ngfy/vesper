@@ -4,6 +4,8 @@
  */
 import type { Scheme, SiteRule } from './core/types';
 
+export const ENGINE_PORT = 'vesper-engine';
+
 export type Message =
   | { type: 'GET_ACTIVE_SCHEME' }
   | { type: 'GET_SCHEMES' }
@@ -13,6 +15,7 @@ export type Message =
   | { type: 'GET_DAILY_COUNT' }
   | { type: 'RECORD_MAPPING'; schemeId: string; mapping: Record<string, string> }
   | { type: 'REFRESH_SITE_REGISTRATIONS' }
+  | { type: 'ENSURE_ENGINE' }
   | { type: 'OPEN_WORKBENCH' };
 
 export type SiteStatus = 'enabled' | 'unconfigured' | 'no-permission' | 'disabled';
@@ -29,9 +32,11 @@ export type MessageResponse<M extends Message> = M extends { type: 'GET_ACTIVE_S
     ? Scheme[]
     : M extends { type: 'GET_SITE_STATE' }
       ? SiteStateResponse
-      : M extends { type: 'INCREMENT_COUNT' } | { type: 'GET_DAILY_COUNT' }
-        ? number
-        : void;
+      : M extends { type: 'ENSURE_ENGINE' }
+        ? boolean
+        : M extends { type: 'INCREMENT_COUNT' } | { type: 'GET_DAILY_COUNT' }
+          ? number
+          : void;
 
 export async function sendMessage<M extends Message>(msg: M): Promise<MessageResponse<M>> {
   return (await chrome.runtime.sendMessage(msg)) as MessageResponse<M>;

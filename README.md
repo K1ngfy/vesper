@@ -13,7 +13,7 @@ VESPER 是一款浏览器扩展（Chrome / Edge，Manifest V3）：在文本粘�
 - **站点拦截**：在 ChatGPT / Claude 等 AI 站点粘贴文本时，自动在粘贴前脱敏（预览确认 / 自动替换 / 仅提醒三种模式）。
 - **12 个内置检测器**：邮箱、中国手机号、IPv4、身份证号、OpenAI / AWS / GitHub Token、JWT、私钥块、数据库连接串、Bearer Token 等。
 - **自定义规则**：关键词、正则、内置检测器三类；支持固定替换 / 编号占位 / 掩码三种替换方式；同值一致（同一邮箱全文共用一个编号）。
-- **工作台**：双栏实时脱敏、命中高亮、命中清单点击定位、文件导入（>500KB 走 Web Worker）、还原模式。
+- **工作台**：双栏实时脱敏、命中高亮、命中清单点击定位、文件导入（较长文本与自定义正则走 Web Worker）、还原模式。
 - **还原**：占位符可还原回原文（编号/固定模式可逆；掩码不可逆）。
 - **本地优先**：无任何网络外发、无统计 SDK、不读 Cookie / 账号凭据，规则与文本永不离开浏览器。
 
@@ -26,7 +26,8 @@ VESPER 是一款浏览器扩展（Chrome / Edge，Manifest V3）：在文本粘�
 ### 方式二：从源码构建（开发者）
 
 ```bash
-npm install
+# 需要 Node.js 22.12 或更新的 22.x 版本
+npm ci
 npm run dev        # 开发模式（自动打开浏览器加载未打包扩展）
 npm run build      # 产出 .output/chrome-mv3（可加载 / 上传商店）
 npm run zip        # 打包商店 zip
@@ -66,7 +67,7 @@ e2e/                  Playwright 扩展 E2E
 - **同值一致**：numbered 模式按规则维护 `原值→占位符` Map，同一邮箱全文共用一个编号。
 - **顺序即优先级**：规则按数组顺序执行，具体规则在前、宽泛规则在后（默认方案已按此排序）。
 - **最小权限（D5）**：manifest 不含任何默认主机权限；用户在配置页启用站点时按域名逐个申请（optional_host_permissions）。content script 由 background 用 `chrome.scripting` 运行时注册，停用即注销。
-- **回填安全**：textarea/input 走原型链 native value setter + 冒泡 input 事件（React 受控组件可用）；contenteditable 走 `execCommand('insertText')`；失败兜底复制到剪贴板，任何情况下不让用户丢文本。
+- **回填安全**：按原光标或选区插入，保留已有草稿。长文本与自定义正则在扩展自己的 Worker 中处理。预览或脱敏失败时会阻止本次粘贴，确认后无法回填时会尝试复制脱敏结果。
 - **站点适配抗漂移**：选择器集中在 `src/content/adapters/`，只用语义 ID/稳定类名（`#prompt-textarea`、`.ProseMirror`）；识别不到自动降级 generic。
 
 ## 权限清单（备商店审核）
@@ -77,6 +78,8 @@ e2e/                  Playwright 扩展 E2E
 | `contextMenus` | 右键「用 VESPER 脱敏选中文本」 |
 | `sidePanel` | 侧边栏形态工作台 |
 | `scripting` | 按已授权站点动态注册/注销 content script（最小权限的实现手段） |
+| `offscreen` | 启动扩展自己的脱敏 Worker，用于较长文本和自定义正则 |
+| `clipboardWrite` | 自动回填失败时复制结果 |
 | `activeTab` | Popup 显示当前标签页站点的拦截状态 |
 | `optional_host_permissions` | 用户添加站点时按域名逐个申请，默认不申请任何主机权限 |
 

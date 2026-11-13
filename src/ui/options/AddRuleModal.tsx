@@ -6,7 +6,6 @@
 import { useState } from 'react';
 import { DETECTORS } from '../../core/detectors';
 import { genId } from '../../core/presets';
-import { testRule } from '../../core/engine';
 import type { Rule, RuleType } from '../../core/types';
 import { t } from '../../i18n';
 import RuleForm from './RuleForm';
@@ -46,7 +45,7 @@ function validate(rule: Rule): string | null {
   if (rule.type !== 'builtin' && !rule.pattern.trim()) return t.options.errPatternRequired;
   if (rule.type === 'regex') {
     try {
-      testRule(' ', rule);
+      new RegExp(rule.pattern, rule.regexFlags);
     } catch (err) {
       return `${t.options.errRegexInvalid}${(err as Error).message}`;
     }

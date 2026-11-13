@@ -1,106 +1,144 @@
-/**
- * 回填算法（VESPEER.md 4.6）：把脱敏后文本写入站点输入框。
- *
- * 关键约束：
- * - textarea/input 必须走原型链 native value setter + 冒泡 input 事件；
- *   直接 el.value= 对 React 受控组件无效（发送按钮不激活）——严禁。
- * - contenteditable 优先 execCommand('insertText')（对 ProseMirror 等编辑器
- *   最友好）；失败再用 Selection/Range 手动插入并派发 beforeinput/input。
- * - 任何一步失败都返回 false，由调用方走"复制到剪贴板"兜底，
- *   任何情况下不许让用户卡死或丢失文本。
- */
+type Field = HTMLTextAreaElement | HTMLInputElement;
 
-export function isEditableTarget(el: Element | null): el is HTMLElement {
-  if (!el || !(el instanceof HTMLElement)) return false;
-  if (el instanceof HTMLTextAreaElement) return !el.disabled && !el.readOnly;
-  if (el instanceof HTMLInputElement) {
-    const type = el.type.toLowerCase();
-    const textLike = ['text', 'search', 'url', 'tel', 'email', 'number', ''].includes(type);
-    return textLike && !el.disabled && !el.readOnly;
+function isField(el: HTMLElement): el is Field {
+  return el instanceof HTMLTextAreaElement || el instanceof HTMLInputElement;
+}
+
+export function getEditableTarget(el: Element | null): HTMLElement | null {
+  if (!(el instanceof HTMLElement)) return null;
+  if (isField(el)) {
+    if (el.matches(':disabled') || el.readOnly) return null;
+    if (
+      el instanceof HTMLInputElement &&
+      !['text', 'search', 'url', 'tel', 'email'].includes(el.type)
+    ) {
+      return null;
+    }
+    return el;
   }
-  return el.isContentEditable;
+  if (!el.isContentEditable) return null;
+  while (el.parentElement?.isContentEditable) el = el.parentElement;
+  return el as HTMLElement;
 }
 
-export function isPasswordField(el: Element | null): boolean {
-  return el instanceof HTMLInputElement && el.type.toLowerCase() === 'password';
+function writeField(el: Field, value: string, cursor: number): void {
+  const proto =
+    el instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+  Object.getOwnPropertyDescriptor(proto, 'value')!.set!.call(el, value);
+  if (el.selectionStart != null) el.setSelectionRange(cursor, cursor);
+  el.dispatchEvent(
+    new InputEvent('input', { bubbles: true, composed: true, inputType: 'insertText' }),
+  );
 }
 
-/** textarea / input：native value setter 路径 */
-function insertIntoField(el: HTMLTextAreaElement | HTMLInputElement, text: string): boolean {
-  try {
-    const proto = Object.getPrototypeOf(el);
-    const desc = Object.getOwnPropertyDescriptor(proto, 'value');
-    if (!desc?.set) return false;
-    el.focus();
-    desc.set.call(el, text);
-    el.dispatchEvent(new Event('input', { bubbles: true }));
-    return true;
-  } catch {
-    return false;
-  }
+function within(el: HTMLElement, range: Range): boolean {
+  return el.contains(range.startContainer) && el.contains(range.endContainer);
 }
 
-/** contenteditable 回填上限：超过则返回 false 走剪贴板兜底，避免大文本回填卡顿/崩溃。
- *
- *  历史阈值 200KB 过高 —— ProseMirror/Slate/Lexical 等富文本编辑器对
- *  insertText/Range 插入会同步解析文本、构建文档模型、diff，30KB+ 即可
- *  让主线程长时间阻塞，200KB 必崩。16KB 是 ProseMirror 实测的相对安全上限，
- *  超过即走剪贴板兜底（textarea 不受此限，仍可大文本回填）。 */
+// Large inserts can block rich text editors even after redaction has finished.
 const CE_INSERT_LIMIT = 16 * 1024;
 
-/** contenteditable：execCommand 优先，Selection/Range 兜底 */
-function insertIntoContentEditable(el: HTMLElement, text: string): boolean {
-  // 大文本不回填到富文本编辑器（ProseMirror/Slate 处理大文档会卡死），改由上层复制到剪贴板
-  if (text.length > CE_INSERT_LIMIT) return false;
-  try {
-    el.focus();
-    const sel = window.getSelection();
-    if (sel) {
-      // 无选区时把光标移到末尾
-      if (!sel.rangeCount || !el.contains(sel.anchorNode)) {
-        const range = document.createRange();
-        range.selectNodeContents(el);
-        range.collapse(false);
-        sel.removeAllRanges();
-        sel.addRange(range);
-      }
-    }
-    // 优先 execCommand：ProseMirror/Slate 等编辑器能正确同步内部状态
-    const ok = document.execCommand('insertText', false, text);
-    if (ok) return true;
-  } catch {
-    /* 继续走兜底 */
-  }
-  try {
-    const sel = window.getSelection();
-    if (!sel || !sel.rangeCount) return false;
-    const range = sel.getRangeAt(0);
-    range.deleteContents();
-    const node = document.createTextNode(text);
-    range.insertNode(node);
-    range.setStartAfter(node);
-    range.collapse(true);
-    sel.removeAllRanges();
-    sel.addRange(range);
-    el.dispatchEvent(
-      new InputEvent('beforeinput', { bubbles: true, inputType: 'insertText', data: text }),
-    );
-    el.dispatchEvent(
-      new InputEvent('input', { bubbles: true, inputType: 'insertText', data: text }),
-    );
-    return true;
-  } catch {
-    return false;
-  }
-}
+/** Capture the paste destination before the preview moves focus. */
+export function captureInsertion(el: HTMLElement, event: Event) {
+  const field = isField(el) ? el : null;
+  const value = field?.value;
+  const start = field?.selectionStart ?? value?.length ?? 0;
+  const end = field?.selectionEnd ?? start;
+  const selection = window.getSelection();
+  const selected = selection?.rangeCount ? selection.getRangeAt(0) : null;
+  const drop =
+    event instanceof DragEvent ? document.caretRangeFromPoint(event.clientX, event.clientY) : null;
+  const range =
+    drop && within(el, drop)
+      ? drop
+      : selected && within(el, selected)
+        ? selected.cloneRange()
+        : null;
+  let edited = false;
+  let undoField: (() => void) | undefined;
+  const noteEdit = () => {
+    edited = true;
+  };
+  el.addEventListener('input', noteEdit);
 
-/** 统一入口：按序尝试，成功即止（文档 4.6 回填算法） */
-export function insertText(target: HTMLElement, text: string): boolean {
-  if (target instanceof HTMLTextAreaElement || target instanceof HTMLInputElement) {
-    return insertIntoField(target, text);
-  }
-  if (target.isContentEditable) {
-    return insertIntoContentEditable(target, text);
-  }
-  return false;
+  return {
+    target: el,
+    release: () => el.removeEventListener('input', noteEdit),
+    getUndo() {
+      if (!undoField) return undefined;
+      const undo = undoField;
+      // Continue tracking edits until the toast is dismissed.
+      const controller = new AbortController();
+      const markEdited = () => {
+        edited = true;
+      };
+      el.addEventListener('input', markEdited, { signal: controller.signal });
+      return { undo, dispose: () => controller.abort() };
+    },
+    insert(text: string): boolean {
+      if (edited || !el.isConnected || getEditableTarget(el) !== el) return false;
+      if (field) {
+        if (field.value !== value) return false;
+        field.focus();
+        if (document.activeElement !== field && field.getRootNode() instanceof Document)
+          return false;
+        if (field.value !== value) return false;
+        const previous = field.value;
+        writeField(
+          field,
+          previous.slice(0, start) + text + previous.slice(end),
+          start + text.length,
+        );
+        const inserted = field.value;
+        edited = false;
+        undoField = () => {
+          if (
+            edited ||
+            !field.isConnected ||
+            getEditableTarget(field) !== field ||
+            field.value !== inserted
+          )
+            return;
+          field.focus();
+          if (field.value === inserted) writeField(field, previous, start);
+        };
+        return true;
+      }
+      if (!selection || text.length > CE_INSERT_LIMIT) return false;
+      el.focus();
+      const caret = range ?? document.createRange();
+      if (range && !within(el, range)) return false;
+      if (!range) {
+        caret.selectNodeContents(el);
+        caret.collapse(false);
+      }
+      selection.removeAllRanges();
+      selection.addRange(caret);
+      if (document.execCommand('insertText', false, text)) return true;
+      const beforeInput = new InputEvent('beforeinput', {
+        bubbles: true,
+        composed: true,
+        cancelable: true,
+        inputType: 'insertText',
+        data: text,
+      });
+      if (!el.dispatchEvent(beforeInput) || !within(el, caret)) return false;
+      caret.deleteContents();
+      const node = document.createTextNode(text);
+      caret.insertNode(node);
+      caret.setStartAfter(node);
+      caret.collapse(true);
+      selection.removeAllRanges();
+      selection.addRange(caret);
+      el.dispatchEvent(
+        new InputEvent('input', {
+          bubbles: true,
+          composed: true,
+          inputType: 'insertText',
+          data: text,
+        }),
+      );
+      return true;
+    },
+  };
 }

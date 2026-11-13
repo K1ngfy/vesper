@@ -3,13 +3,16 @@
  *
  * 方法：注入【真实构建产物】.output/chrome-mv3/content-scripts/content.js，
  * 用 addInitScript 预置 chrome.runtime.sendMessage 桩（返回指定站点状态与方案），
- * 再以合成 ClipboardEvent 模拟用户粘贴。可覆盖：
+ * 再用真实剪贴板与快捷键触发粘贴。可覆盖：
  * textarea 自动替换 / contenteditable 预览确认 / 无命中放行 / 密码框永不拦截。
  * （chrome.scripting 注册与权限授予属浏览器原生 UI，仍需手工验收。）
  */
+import { fileURLToPath } from 'node:url';
 import { test, expect } from '@playwright/test';
 
-const CONTENT_JS = '../.output/chrome-mv3/content-scripts/content.js';
+const CONTENT_JS = fileURLToPath(
+  new URL('../../.output/chrome-mv3/content-scripts/content.js', import.meta.url),
+);
 const FIXTURE = new URL('../fixtures/intercept-test.html', import.meta.url).pathname;
 
 /** 测试方案：keyword 机密词 + builtin email（numbered） */
@@ -55,7 +58,7 @@ async function setup(
   // fallbackCopy 用 execCommand('copy') + navigator.clipboard.writeText 两级兜底；
   // headless 下 execCommand('copy') 常返回 false，需 clipboard-write 权限让
   // navigator.clipboard.writeText 兜底成功，否则大文本测试会误报"复制失败"。
-  await page.context().grantPermissions(['clipboard-write']);
+  await page.context().grantPermissions(['clipboard-read', 'clipboard-write']);
   await page.addInitScript((state) => {
     // chrome API 桩：GET_SITE_STATE 返回可变状态；onChanged 监听器可被测试触发
     const w = window as unknown as {
@@ -90,27 +93,10 @@ async function setup(
   await page.waitForTimeout(200); // 等 init 异步完成、监听挂载
 }
 
-/** 合成 paste 事件（Chromium 的 ClipboardEvent 构造器不接受 clipboardData 时走兜底） */
 async function pasteInto(page: import('@playwright/test').Page, selector: string, text: string) {
-  await page.evaluate(
-    ({ sel, text }) => {
-      const target = document.querySelector(sel)! as HTMLElement;
-      target.focus();
-      const dt = new DataTransfer();
-      dt.setData('text/plain', text);
-      let ev: Event = new ClipboardEvent('paste', {
-        bubbles: true,
-        cancelable: true,
-        clipboardData: dt,
-      });
-      if (!(ev as ClipboardEvent).clipboardData) {
-        ev = new Event('paste', { bubbles: true, cancelable: true });
-        Object.defineProperty(ev, 'clipboardData', { value: dt });
-      }
-      target.dispatchEvent(ev);
-    },
-    { sel: selector, text },
-  );
+  await page.locator(selector).focus();
+  await page.evaluate((value) => navigator.clipboard.writeText(value), text);
+  await page.keyboard.press('ControlOrMeta+V');
 }
 
 test.describe('粘贴拦截全链路（真实构建产物 + chrome API 桩）', () => {
@@ -142,15 +128,14 @@ test.describe('粘贴拦截全链路（真实构建产物 + chrome API 桩）', 
   test('无命中：完全放行，无 Toast 无弹窗', async ({ page }) => {
     await setup(page, 'auto');
     await pasteInto(page, '#ta', '今天天气不错');
-    // 合成事件不走浏览器默认插入，值保持空 = 未被 preventDefault 拦截改写
-    await expect(page.locator('#ta')).toHaveValue('');
+    await expect(page.locator('#ta')).toHaveValue('今天天气不错');
     await expect(page.locator('#vesper-shadow-host')).toHaveCount(0);
   });
 
   test('密码框：永不拦截', async ({ page }) => {
     await setup(page, 'auto');
     await pasteInto(page, '#pw', '星辰科技');
-    await expect(page.locator('#pw')).toHaveValue('');
+    await expect(page.locator('#pw')).toHaveValue('星辰科技');
     await expect(page.locator('#vesper-shadow-host')).toHaveCount(0);
   });
 
@@ -186,28 +171,21 @@ test.describe('粘贴拦截全链路（真实构建产物 + chrome API 桩）', 
   });
 });
 
-test.describe('大文本性能回归（Worker 异步 + 回填兜底）', () => {
-  // 64KB 文本：远超 12KB Worker 阈值，必走异步路径；含大量邮箱命中。
-  // 测试环境 chrome.runtime.getURL 未桩时 Worker 创建会失败，但兜底链
-  // 必须仍能把文本安全回填到 textarea（native setter 不受 CE_INSERT_LIMIT 限制），
-  // 绝不卡死或丢失文本。
-  const LARGE_BYTES = 64 * 1024;
+test.describe('扩展 Worker 不可用', () => {
+  const large = 'a@x.com '.repeat(8 * 1024);
 
-  test('大文本粘贴到 textarea 不卡死、文本不丢失', async ({ page }) => {
+  test('自动替换：Worker 失败时不回填未脱敏内容', async ({ page }) => {
     await setup(page, 'auto');
-    await pasteInto(page, '#ta', 'a@x.com '.repeat(LARGE_BYTES / 8));
-    // 能在合理时间内读到值 = 主线程没被同步引擎冻死
-    const value = await page.locator('#ta').inputValue({ timeout: 8000 });
-    expect(value.length).toBeGreaterThan(1000);
-    // 无论 Worker 成功（脱敏为 [EMAIL_]）还是失败兜底（原文），都应含邮箱特征
-    expect(/@|EMAIL/.test(value)).toBe(true);
+    await page.locator('#ta').fill('原有草稿');
+    await pasteInto(page, '#ta', large);
+    await expect(page.getByText(/已阻止粘贴/)).toBeVisible();
+    await expect(page.locator('#ta')).toHaveValue('原有草稿');
   });
 
-  test('大文本粘贴到 contenteditable 走剪贴板兜底，不卡死', async ({ page }) => {
-    await setup(page, 'auto');
-    await pasteInto(page, '#ce', 'a@x.com '.repeat(LARGE_BYTES / 8));
-    // contenteditable 大文本回填必走 fallbackCopy（CE_INSERT_LIMIT=16KB），
-    // Toast 出现 = 兜底链正常工作，未冻死页面
-    await expect(page.getByText(/已脱敏并复制/)).toBeVisible({ timeout: 8000 });
+  test('预览确认：Worker 失败时不回填未脱敏内容', async ({ page }) => {
+    await setup(page, 'preview');
+    await pasteInto(page, '#ce', large);
+    await expect(page.getByText(/已阻止粘贴/)).toBeVisible();
+    await expect(page.locator('#ce')).toHaveText('');
   });
 });

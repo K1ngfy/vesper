@@ -14,6 +14,7 @@ import {
   getActiveScheme,
   getDailyCount,
   getLastMapping,
+  getMappings,
   getSchemes,
   getSettings,
   getSites,
@@ -21,12 +22,43 @@ import {
   hostToOrigins,
   incrementDailyCount,
   pushMapping,
-  saveSettings,
+  updateSettings,
   urlToHost,
 } from '@/src/storage';
 import type { SiteStateResponse } from '@/src/messages';
 import { genId } from '@/src/core/presets';
 import { restore } from '@/src/core/restore';
+
+const ENGINE_PAGE = '/engine.html';
+let openingEngine: Promise<void> | undefined;
+
+function ensureEnginePage(): Promise<void> {
+  return (openingEngine ??= (async () => {
+    const url = chrome.runtime.getURL(ENGINE_PAGE);
+    const open =
+      typeof chrome.runtime.getContexts === 'function'
+        ? (
+            await chrome.runtime.getContexts({
+              contextTypes: ['OFFSCREEN_DOCUMENT'],
+              documentUrls: [url],
+            })
+          ).length > 0
+        : (
+            await (
+              self as unknown as { clients: { matchAll(): Promise<{ url: string }[]> } }
+            ).clients.matchAll()
+          ).some((client) => client.url === url);
+    if (!open) {
+      await chrome.offscreen.createDocument({
+        url: ENGINE_PAGE,
+        reasons: [chrome.offscreen.Reason.WORKERS],
+        justification: 'Run local redaction in a worker independent of the website CSP.',
+      });
+    }
+  })().finally(() => {
+    openingEngine = undefined;
+  }));
+}
 
 /** 打开工作台页（新标签页） */
 async function openWorkbench(): Promise<void> {
@@ -43,19 +75,26 @@ async function handleRestoreSelection(
 ): Promise<void> {
   const text = info.selectionText ?? '';
   if (!text || tab?.id == null) return;
-  const last = await getLastMapping();
+  const last =
+    (await getLastMapping()) ??
+    ((await getSettings())?.persistMappings ? (await getMappings())[0] : undefined);
   const restored = restore(text, last?.mapping ?? {});
   const changed = restored !== text;
   await chrome.scripting
     .executeScript({
-      target: { tabId: tab.id },
-      func: (payload: { text: string; changed: boolean }) => {
-        if (payload.changed) {
-          void navigator.clipboard.writeText(payload.text).catch(() => {});
-        }
+      target: { tabId: tab.id, frameIds: [info.frameId ?? 0] },
+      func: async (payload: { text: string; changed: boolean }) => {
+        const copied =
+          payload.changed &&
+          (await navigator.clipboard?.writeText(payload.text).then(
+            () => true,
+            () => false,
+          ));
         const tip = document.createElement('div');
         tip.textContent = payload.changed
-          ? '✳ VESPER 已还原并复制'
+          ? copied
+            ? '✳ VESPER 已还原并复制'
+            : '✳ 已还原，但写入剪贴板失败'
           : '✳ 未检测到可还原的占位符（请先用 VESPER 脱敏）';
         tip.style.cssText =
           'position:fixed;top:16px;right:16px;z-index:2147483647;background:#111111;color:#ffffff;padding:10px 14px;border-radius:8px;font:13px -apple-system,"PingFang SC",sans-serif;box-shadow:0 8px 24px rgba(0,0,0,.2);';
@@ -123,125 +162,68 @@ function setupContextMenus(): Promise<void> {
   return menuQueue;
 }
 
-/** 判断目标 origin 是否被已授权 origin 覆盖：相等或已授权全局通配权限 */
-function originCoveredBy(target: string, grantedOrigins: string[]): boolean {
-  return grantedOrigins.includes('*://*/*') || grantedOrigins.includes(target);
-}
-
-/**
- * 按 siteScope + 站点启用状态 + 主机权限，同步 content script 注册（文档 D5 / 4.4）。
- * - list 模式：逐站点按 host 派生两条 origin（根域 + 子域）注册，需两条均已授权。
- * - global 模式：注册单个覆盖全部站点的 content script（全局通配 matches），需全局通配权限已授权；
- *   排除名单由 GET_SITE_STATE 在运行时判定，不在此处区分注册。
- *
- * 并发保护：onInstalled / 权限变化 / REFRESH_SITE_REGISTRATIONS 三方都会触发，
- * 多次交叠时"注销已被别的调用注销的 id"会抛 Nonexistent script ID（unhandled
- * rejection）。这里用串行队列 + 容错注销保证同一时刻只有一次同步在执行。
- */
 let syncQueue: Promise<void> = Promise.resolve();
 
 function syncContentScriptRegistrations(): Promise<void> {
   syncQueue = syncQueue
-    .then(() => doSyncRegistrations())
-    .catch((err) => console.warn('[VESPER] content script 同步失败:', (err as Error)?.message ?? err));
+    .then(doSyncRegistrations)
+    .catch(() => console.warn('[VESPER] 内容脚本同步失败'));
   return syncQueue;
 }
 
-/**
- * 注册单个 content script；遇到"同 id 已存在"（注册表残留/上一轮未注销干净）
- * 时先单独注销再重试一次，避免整批注册被一条残留记录带崩。
- */
-async function registerScript(script: chrome.scripting.RegisteredContentScript): Promise<void> {
-  try {
-    await chrome.scripting.registerContentScripts([script]);
-  } catch (err) {
-    if (!/duplicate/i.test((err as Error).message ?? '')) throw err;
-    try {
-      await chrome.scripting.unregisterContentScripts({ ids: [script.id] });
-    } catch {
-      /* 残留记录可能已被清掉，忽略 */
-    }
-    await chrome.scripting.registerContentScripts([script]);
-  }
-}
-
 async function doSyncRegistrations(): Promise<void> {
-  const sites = await getSites();
-  const settings = await getSettings();
-  const scope = settings?.siteScope ?? 'list';
-  const granted = await chrome.permissions.getAll();
-  const origins = granted.origins ?? [];
-
-  // 注销现有 VESPER 注册（站点级 vesper-site-* + 全局级 vesper-global）
-  let existing: chrome.scripting.RegisteredContentScript[] = [];
-  try {
-    existing = await chrome.scripting.getRegisteredContentScripts();
-  } catch (err) {
-    console.warn('[VESPER] 读取 content script 注册失败:', (err as Error).message);
-  }
-  const ids = existing.filter((s) => s.id.startsWith('vesper-')).map((s) => s.id);
-  if (ids.length > 0) {
-    try {
-      await chrome.scripting.unregisterContentScripts({ ids });
-    } catch (err) {
-      // 已被其它流程注销 / 注册表已失效：都属可恢复状态，不阻断后续注册
-      console.debug('[VESPER] 注销旧注册跳过:', (err as Error).message);
+  const [sites, settings, existing] = await Promise.all([
+    getSites(),
+    getSettings(),
+    chrome.scripting.getRegisteredContentScripts(),
+  ]);
+  const candidates =
+    settings?.siteScope === 'global'
+      ? [{ id: 'vesper-global', matches: ['*://*/*'] }]
+      : sites
+          .filter((site) => site.enabled && site.host)
+          .map((site) => ({
+            id: `vesper-site-${site.id}`,
+            matches: hostToOrigins(site.host),
+          }));
+  const permitted = await Promise.all(
+    candidates.map(async ({ id, matches }) => {
+      const granted = await chrome.permissions.contains({ origins: matches }).catch(() => false);
+      return granted
+        ? { id, matches, js: ['content-scripts/content.js'], runAt: 'document_start' as const }
+        : null;
+    }),
+  );
+  const desired = new Map(
+    permitted.flatMap((script) => (script ? [[script.id, script] as const] : [])),
+  );
+  const removed: string[] = [];
+  for (const script of existing) {
+    if (!script.id.startsWith('vesper-')) continue;
+    const next = desired.get(script.id);
+    if (
+      next &&
+      next.matches.length === script.matches?.length &&
+      next.matches.every((pattern) => script.matches!.includes(pattern))
+    ) {
+      desired.delete(script.id);
+    } else {
+      removed.push(script.id);
     }
   }
-
-  if (scope === 'global') {
-    if (!origins.includes('*://*/*')) {
-      console.debug('[VESPER] 全局模式未授权 *://*/*，content script 暂未注册');
-      return;
-    }
-    try {
-      await registerScript({
-        id: 'vesper-global',
-        js: ['content-scripts/content.js'],
-        matches: ['*://*/*'],
-        runAt: 'document_start',
-        persistAcrossSessions: true,
-      });
-      console.debug('[VESPER] 全局 content script 已注册');
-    } catch (err) {
-      console.warn('[VESPER] 全局 content script 注册失败:', (err as Error).message);
-    }
-    return;
-  }
-
-  // list 模式：逐站点注册 + 单站点失败不拖垮整批（此前一批注册会因单个非法 pattern 整体静默失败）
-  let ok = 0;
-  for (const s of sites) {
-    if (!s.enabled || !s.host) continue;
-    const siteOrigins = hostToOrigins(s.host);
-    // 两条 origin 都必须已授权，否则 chrome.scripting 会因未授权 host 整批失败
-    if (!siteOrigins.every((o) => originCoveredBy(o, origins))) continue;
-    try {
-      await registerScript({
-        id: `vesper-site-${s.id}`,
-        js: ['content-scripts/content.js'],
-        matches: siteOrigins,
-        runAt: 'document_start',
-        persistAcrossSessions: true,
-      });
-      ok += 1;
-    } catch (err) {
-      // 只记录错误本身，不打印任何用户规则内容（隐私红线）
-      console.warn(`[VESPER] 站点 ${s.host} 注册失败:`, (err as Error).message);
-    }
-  }
-  if (sites.some((s) => s.enabled)) {
-    console.debug(`[VESPER] content script 注册完成：${ok} 个站点生效`);
+  if (removed.length) await chrome.scripting.unregisterContentScripts({ ids: removed });
+  for (const script of desired.values()) {
+    await chrome.scripting.registerContentScripts([script]).catch(() => {
+      console.warn('[VESPER] 站点内容脚本注册失败');
+    });
   }
 }
 
 export default defineBackground(() => {
-  // 启动即播种（幂等）并同步注册
-  void ensureSeeded().then(syncContentScriptRegistrations);
+  const ready = ensureSeeded();
+  void ready.then(syncContentScriptRegistrations).catch(() => console.warn('[VESPER] 初始化失败'));
 
   chrome.runtime.onInstalled.addListener(() => {
-    void ensureSeeded().then(syncContentScriptRegistrations);
-
     // 右键菜单：打开工作台 + 选中即脱敏（文档 T7）
     void setupContextMenus();
   });
@@ -267,37 +249,40 @@ export default defineBackground(() => {
     }
   });
 
-  // 权限变化 → 重新同步注册（站点启用/停用时由 options 主动发消息触发）
-  chrome.permissions.onAdded.addListener(() => void syncContentScriptRegistrations());
-  chrome.permissions.onRemoved.addListener(() => void syncContentScriptRegistrations());
+  function onPermissionChange() {
+    void chrome.storage.local.set({ 'vesper:permissionsRevision': Date.now() }).catch(() => {});
+    void syncContentScriptRegistrations();
+  }
+  chrome.permissions.onAdded.addListener(onPermissionChange);
+  chrome.permissions.onRemoved.addListener(onPermissionChange);
 
   // 消息路由
   chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     void (async () => {
+      await ready;
       switch (msg?.type) {
         case 'GET_ACTIVE_SCHEME':
           return (await getActiveScheme()) ?? null;
         case 'GET_SCHEMES':
           return await getSchemes();
         case 'SET_ACTIVE_SCHEME': {
-          const settings = await getSettings();
-          if (settings) {
-            settings.activeSchemeId = msg.schemeId;
-            await saveSettings(settings);
+          if ((await getSchemes()).some((scheme) => scheme.id === msg.schemeId)) {
+            await updateSettings({ activeSchemeId: msg.schemeId });
           }
           return;
         }
         case 'GET_SITE_STATE': {
+          const host = urlToHost(msg.url);
+          if (!host) return { status: 'unconfigured' } satisfies SiteStateResponse;
           const settings = await getSettings();
           // 总开关关闭：仍返回站点信息供 Popup 展示，但状态为 disabled
           if (settings?.globalEnabled === false) {
             const site = await findSiteByUrl(msg.url);
-            return (site
-              ? { status: 'disabled', site }
-              : { status: 'unconfigured' }) satisfies SiteStateResponse;
+            return (
+              site ? { status: 'disabled', site } : { status: 'unconfigured' }
+            ) satisfies SiteStateResponse;
           }
           const scope = settings?.siteScope ?? 'list';
-          const host = urlToHost(msg.url);
 
           if (scope === 'global') {
             // 全局模式：排除名单内的 host 不拦截
@@ -354,6 +339,9 @@ export default defineBackground(() => {
         case 'REFRESH_SITE_REGISTRATIONS':
           await syncContentScriptRegistrations();
           return;
+        case 'ENSURE_ENGINE':
+          await ensureEnginePage();
+          return true;
         case 'OPEN_WORKBENCH':
           await openWorkbench();
           return;

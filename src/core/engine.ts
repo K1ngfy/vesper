@@ -2,7 +2,7 @@
  * VESPER 脱敏引擎（VESPEER.md 第 5 节）——纯 TS，零浏览器 API 依赖。
  *
  * 硬性要求实现说明：
- * 1. 防二次替换：每次命中先置入内部令牌 \uE000{hitIndex}\uE001，
+ * 1. 防二次替换：每次命中先置入内部令牌 （使用私用区字符编码索引），
  *    全部规则执行完毕后统一换成最终占位符；且所有替换回调检查
  *    "命中片段含令牌即跳过"，检测器正则亦排除令牌字符，双保险。
  * 2. 同值一致：numbered 模式每规则一个 Map(原值→占位符)+计数器；
@@ -18,9 +18,18 @@
 import { getDetector } from './detectors';
 import type { DesensitizeResult, Hit, Rule, Scheme } from './types';
 
-const TOKEN_START = '\uE000'; // 私用区字符，正常文本不会包含
+const TOKEN_START = '\uE000';
 const TOKEN_END = '\uE001';
-const TOKEN_RE = /\uE000(\d+)\uE001/g;
+const TOKEN_DIGIT = 0xe010;
+const TOKEN_RE = /\uE000([\uE010-\uE019]+)\uE001/g;
+const TOKEN_CHAR = /[\uE000\uE001\uE010-\uE019]/;
+
+function encodeToken(index: number): string {
+  const digits = String(index).replace(/\d/g, (digit) =>
+    String.fromCharCode(TOKEN_DIGIT + Number(digit)),
+  );
+  return TOKEN_START + digits + TOKEN_END;
+}
 
 /** numbered 模板中的编号占位：独立的字母 n（如 [EMAIL_n] 中的 n） */
 const NUMBER_SLOT_RE = /(?<![A-Za-z0-9])n(?![A-Za-z0-9])/;
@@ -41,7 +50,8 @@ export function maskValue(
     const domain = value.slice(at);
     return maskValue(local, keep, false) + domain;
   }
-  const { head, tail } = keep;
+  const head = Math.max(0, Math.trunc(keep.head) || 0);
+  const tail = Math.max(0, Math.trunc(keep.tail) || 0);
   if (value.length <= head + tail) {
     return '*'.repeat(Math.max(3, value.length));
   }
@@ -53,6 +63,7 @@ export function maskValue(
 function compileRule(rule: Rule): { regex: RegExp; group?: number }[] {
   switch (rule.type) {
     case 'keyword': {
+      if (!rule.pattern) return [];
       let src = escapeRegExp(rule.pattern);
       if (rule.wholeWord) {
         // 自绘词边界：\b 对中文无效，改用字母数字下划线断言
@@ -79,22 +90,31 @@ function compileRule(rule: Rule): { regex: RegExp; group?: number }[] {
 
 /** 展开 regex 规则的 fixed 模板中的 $1 等捕获组引用 */
 function expandTemplate(template: string, args: unknown[]): string {
+  const namedGroups = typeof args.at(-1) === 'object';
+  const lastCapture = args.length - (namedGroups ? 4 : 3);
   return template.replace(/\$(\d+)/g, (_, d) => {
-    const v = args[Number(d)];
+    const index = Number(d);
+    const v = index <= lastCapture ? args[index] : undefined;
     return typeof v === 'string' ? v : '';
   });
 }
 
-export function desensitize(text: string, scheme: Scheme): DesensitizeResult {
+export function desensitize(text: string, scheme: Scheme, strict = false): DesensitizeResult {
   const start = Date.now();
   if (!text || !scheme?.enabled) {
     return { output: text ?? '', hits: [], mapping: {}, durationMs: 0 };
   }
 
-  let current = text;
+  // Preserve any literal token-shaped input by assigning it a token of its own.
+  const literals: string[] = [];
+  let current = text.replace(TOKEN_RE, (literal) => {
+    literals.push(literal);
+    return encodeToken(literals.length - 1);
+  });
   const hits: Hit[] = [];
   const finals: string[] = []; // hitIndex -> 最终替换文本
-  const mapping: Record<string, string> = {};
+  const mapping = new Map<string, string>();
+  const ambiguous = new Set<string>();
 
   for (const rule of scheme.rules) {
     if (!rule.enabled) continue;
@@ -106,8 +126,8 @@ export function desensitize(text: string, scheme: Scheme): DesensitizeResult {
     let compiled: { regex: RegExp; group?: number }[];
     try {
       compiled = compileRule(rule);
-    } catch {
-      // 非法正则理论上在保存期已被拦截；执行期兜底跳过该规则，不中断整体脱敏
+    } catch (error) {
+      if (strict) throw error;
       continue;
     }
 
@@ -116,7 +136,7 @@ export function desensitize(text: string, scheme: Scheme): DesensitizeResult {
       current = current.replace(regex, (...args: unknown[]) => {
         const full = args[0] as string;
         // 双保险：命中片段含内部令牌（已被前序规则替换过）→ 原样返回
-        if (full.includes(TOKEN_START)) return full;
+        if (TOKEN_CHAR.test(full)) return full;
 
         const original = group != null ? (args[group] as string) : full;
         if (original == null || original === '') return full;
@@ -150,13 +170,12 @@ export function desensitize(text: string, scheme: Scheme): DesensitizeResult {
         }
 
         // 还原映射：仅 numbered / fixed 且可逆（文档 4.7）；mask 不可逆不入表
-        if (rule.mode === 'numbered' || rule.mode === 'fixed') {
-          const existing = mapping[finalText];
-          if (existing == null) {
-            mapping[finalText] = original;
-          } else if (existing !== original) {
-            // fixed 模式一个替换文本对应多个原值 → 不可逆，移除该映射
-            delete mapping[finalText];
+        if (rule.mode !== 'mask' && finalText && !ambiguous.has(finalText)) {
+          const existing = mapping.get(finalText);
+          if (existing === undefined) mapping.set(finalText, original);
+          else if (existing !== original) {
+            mapping.delete(finalText);
+            ambiguous.add(finalText);
           }
         }
 
@@ -169,11 +188,15 @@ export function desensitize(text: string, scheme: Scheme): DesensitizeResult {
           index: -1, // 最终 pass 统一回填
         });
         finals.push(finalText);
-        const token = `${TOKEN_START}${hitIndex}${TOKEN_END}`;
+        const token = encodeToken(literals.length + hitIndex);
 
         if (group != null) {
           // 部分替换：只换掉捕获组，保留前后文
-          return full.replace(original, token);
+          // Built-in capture groups replace a value after the preceding prefix groups.
+          const offset = args
+            .slice(1, group)
+            .reduce<number>((length, value) => length + String(value ?? '').length, 0);
+          return full.slice(0, offset) + token + full.slice(offset + original.length);
         }
         return token;
       });
@@ -186,15 +209,22 @@ export function desensitize(text: string, scheme: Scheme): DesensitizeResult {
   TOKEN_RE.lastIndex = 0;
   let m: RegExpExecArray | null;
   while ((m = TOKEN_RE.exec(current)) !== null) {
-    const hitIndex = Number(m[1]);
+    let index = 0;
+    for (const digit of m[1]!) index = index * 10 + digit.charCodeAt(0) - TOKEN_DIGIT;
     output += current.slice(last, m.index);
-    hits[hitIndex]!.index = output.length;
-    output += finals[hitIndex]!;
+    if (index < literals.length) {
+      output += literals[index];
+    } else {
+      const hitIndex = index - literals.length;
+      hits[hitIndex]!.index = output.length;
+      output += finals[hitIndex]!;
+    }
     last = m.index + m[0].length;
   }
   output += current.slice(last);
 
-  return { output, hits, mapping, durationMs: Date.now() - start };
+  hits.sort((a, b) => a.index - b.index);
+  return { output, hits, mapping: Object.fromEntries(mapping), durationMs: Date.now() - start };
 }
 
 /** 规则测试台用：用单条规则对样本文本试跑（非法正则直接向上抛错给编辑器提示） */

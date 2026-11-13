@@ -14,18 +14,23 @@ import type { DesensitizeResult } from '../core/types';
 import { t } from '../i18n';
 
 const HOST_ID = 'vesper-shadow-host';
-const STYLE_ATTR = 'data-vesper-style';
+let root: ShadowRoot | undefined;
+let activePreview: HTMLDialogElement | undefined;
+let dismissToast: (() => void) | undefined;
 
 function ensureHost(): ShadowRoot {
-  let host = document.getElementById(HOST_ID) as HTMLElement | null;
-  if (!host) {
-    host = document.createElement('div');
-    host.id = HOST_ID;
-    host.setAttribute('data-vesper-ui', '1');
-    document.documentElement.appendChild(host);
-  }
-  if (!host.shadowRoot) host.attachShadow({ mode: 'open' });
-  return host.shadowRoot!;
+  if (root?.host.isConnected) return root;
+  const host = document.createElement('div');
+  host.id = HOST_ID;
+  host.dataset.vesperUi = '1';
+  host.style.cssText = 'position:fixed;inset:0 auto auto 0;width:0;height:0;z-index:2147483647;';
+  const shadow = host.attachShadow({ mode: 'open' });
+  const sheet = new CSSStyleSheet();
+  sheet.replaceSync(BASE_STYLE);
+  shadow.adoptedStyleSheets = [sheet];
+  document.documentElement.appendChild(host);
+  root = shadow;
+  return shadow;
 }
 
 const BASE_STYLE = `
@@ -44,20 +49,12 @@ const BASE_STYLE = `
   .btn:hover { background: #333333; }
   .btn.ghost { background: #ffffff; border: 1px solid #9ca3af; color: #111111; }
   .btn.danger { background: #ffffff; border: 1px solid #111111; color: #111111; }
-  del { color: #6b7280; text-decoration: line-through; }
-  mark { background: #f3f4f6; color: #111111; border-radius: 2px; padding: 0 2px; }
 
-  .overlay {
-    position: fixed; inset: 0; z-index: 2147483647;
-    background: rgba(0,0,0,.45);
-    display: flex; align-items: center; justify-content: center;
-  }
-  .dialog { width: min(560px, 90vw); max-height: 80vh; overflow: auto; padding: 20px; }
+  .dialog { width: min(560px, 90vw); max-height: 80vh; overflow: auto; padding: 20px; margin: auto; }
+  .dialog::backdrop { background: rgba(0,0,0,.45); }
   .title { font-size: 16px; font-weight: 600; margin-bottom: 4px; }
   .title .hint { font-size: 12px; color: #6b7280; font-weight: 400; margin-left: 6px; }
   .rows { margin: 12px 0; }
-  .row { padding: 6px 0; border-bottom: 1px dashed #e5e5e5; font-size: 13px; }
-  .row .rule { color: #6b7280; }
   .more { color: #6b7280; font-size: 12px; }
   .actions { display: flex; gap: 10px; justify-content: flex-end; margin-top: 16px; }
   .toast {
@@ -66,24 +63,9 @@ const BASE_STYLE = `
   }
 `;
 
-/** 样式节点只挂一次（重复挂会让 Shadow DOM 越来越重） */
-function ensureStyle(shadow: ShadowRoot): void {
-  if (shadow.querySelector(`style[${STYLE_ATTR}]`)) return;
-  const style = document.createElement('style');
-  style.setAttribute(STYLE_ATTR, '1');
-  style.textContent = BASE_STYLE;
-  shadow.appendChild(style);
-}
-
-/** 清空内容但保留样式节点 */
-function clearContent(shadow: ShadowRoot): void {
-  for (const node of Array.from(shadow.children)) {
-    if (node.tagName !== 'STYLE') node.remove();
-  }
-}
-
 function makeButton(label: string, act: string, cls: string): HTMLButtonElement {
   const btn = document.createElement('button');
+  btn.type = 'button';
   btn.className = cls;
   btn.dataset.act = act;
   btn.textContent = label;
@@ -99,15 +81,12 @@ export interface PreviewActions {
 /** 预览弹窗：命中 diff（原文删除线 / 结果高亮）+ 三个操作按钮 */
 export function showPreview(res: DesensitizeResult, actions: PreviewActions): void {
   const shadow = ensureHost();
-  clearContent(shadow);
-  ensureStyle(shadow);
+  closePreview();
+  dismissToast?.();
 
-  const wrap = document.createElement('div');
-  wrap.className = 'overlay';
-  wrap.setAttribute('data-vesper-ui', '1');
-
-  const dialog = document.createElement('div');
+  const dialog = document.createElement('dialog');
   dialog.className = 'panel dialog';
+  dialog.setAttribute('aria-label', t.content.previewTitle);
 
   const title = document.createElement('div');
   title.className = 'title';
@@ -120,22 +99,26 @@ export function showPreview(res: DesensitizeResult, actions: PreviewActions): vo
 
   const rows = document.createElement('div');
   rows.className = 'rows';
+  // Keep the sensitive strings out of the page-accessible shadow tree.
+  const details = rows.attachShadow({ mode: 'closed' });
+  const sheet = new CSSStyleSheet();
+  sheet.replaceSync(`
+    div { padding: 6px 0; border-bottom: 1px dashed #e5e5e5; font-size: 13px; overflow-wrap: anywhere; }
+    span, del { color: #6b7280; }
+    mark { background: #f3f4f6; color: #111; }
+  `);
+  details.adoptedStyleSheets = [sheet];
+  const excerpt = (text: string) => (text.length > 300 ? text.slice(0, 300) + '…' : text);
   for (const h of res.hits.slice(0, 50)) {
     const row = document.createElement('div');
-    row.className = 'row';
     const rule = document.createElement('span');
-    rule.className = 'rule';
-    rule.textContent = h.ruleName;
-    row.appendChild(rule);
-    row.appendChild(document.createElement('br'));
+    rule.textContent = excerpt(h.ruleName);
     const del = document.createElement('del');
-    del.textContent = h.original;
-    row.appendChild(del);
-    row.appendChild(document.createTextNode(' → '));
+    del.textContent = excerpt(h.original);
     const mark = document.createElement('mark');
-    mark.textContent = h.replaced;
-    row.appendChild(mark);
-    rows.appendChild(row);
+    mark.textContent = excerpt(h.replaced);
+    row.append(rule, document.createElement('br'), del, ' → ', mark);
+    details.appendChild(row);
   }
   dialog.appendChild(rows);
 
@@ -154,38 +137,53 @@ export function showPreview(res: DesensitizeResult, actions: PreviewActions): vo
   actionBar.append(cancelBtn, originalBtn, confirmBtn);
   dialog.appendChild(actionBar);
 
-  wrap.appendChild(dialog);
-
-  const close = () => clearContent(shadow);
-
-  confirmBtn.addEventListener('click', () => {
-    close();
+  cancelBtn.autofocus = true;
+  confirmBtn.addEventListener('click', (event) => {
+    if (!event.isTrusted) return;
+    closePreview();
     actions.onConfirm();
   });
-  originalBtn.addEventListener('click', () => {
-    // 粘贴原文需二次确认（文档 4.6）
+  originalBtn.addEventListener('click', (event) => {
+    if (!event.isTrusted) return;
     if (window.confirm(t.content.pasteOriginalConfirm)) {
-      close();
+      closePreview();
       actions.onPasteOriginal();
     }
   });
-  cancelBtn.addEventListener('click', () => {
-    close();
+  const cancel = () => {
+    closePreview();
     actions.onCancel();
+  };
+  cancelBtn.addEventListener('click', cancel);
+  dialog.addEventListener('cancel', (event) => {
+    event.preventDefault();
+    cancel();
   });
+  shadow.appendChild(dialog);
+  activePreview = dialog;
+  try {
+    dialog.showModal();
+  } catch (error) {
+    closePreview();
+    throw error;
+  }
+}
 
-  shadow.appendChild(wrap);
+export function closePreview(): void {
+  activePreview?.close();
+  activePreview?.remove();
+  activePreview = undefined;
 }
 
 export interface ToastActions {
   onUndo?: () => void;
-  onView?: () => void;
+  onDismiss?: () => void;
 }
 
-/** Toast：右下角浮层，6 秒自动消失，可带撤销/查看 */
+/** Toast：右下角浮层，6 秒自动消失，可带撤销 */
 export function showToast(message: string, actions: ToastActions = {}): void {
   const shadow = ensureHost();
-  ensureStyle(shadow);
+  dismissToast?.();
 
   const toast = document.createElement('div');
   toast.setAttribute('data-vesper-ui', '1');
@@ -197,27 +195,28 @@ export function showToast(message: string, actions: ToastActions = {}): void {
 
   if (actions.onUndo) {
     const undo = makeButton(t.content.undo, 'undo', 'btn ghost');
-    undo.addEventListener('click', () => {
-      actions.onUndo!();
-      dismiss();
+    undo.addEventListener('click', (event) => {
+      if (!event.isTrusted) return;
+      try {
+        actions.onUndo!();
+      } finally {
+        dismiss();
+      }
     });
     toast.appendChild(undo);
   }
-  if (actions.onView) {
-    const view = makeButton(t.content.view, 'view', 'btn ghost');
-    view.addEventListener('click', () => actions.onView!());
-    toast.appendChild(view);
-  }
-
   shadow.appendChild(toast);
   const timer = setTimeout(dismiss, 6000);
+  dismissToast = dismiss;
   function dismiss() {
     clearTimeout(timer);
     toast.remove();
+    actions.onDismiss?.();
+    dismissToast = undefined;
   }
 }
 
 /** 判断事件目标是否在 VESPER 自身 UI 内（护栏） */
 export function isOwnUI(el: EventTarget | null): boolean {
-  return el instanceof HTMLElement && el.closest('[data-vesper-ui]') != null;
+  return el === root?.host;
 }

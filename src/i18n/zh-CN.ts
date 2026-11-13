@@ -180,9 +180,10 @@ export const zhCN = {
     btnPasteOriginal: '粘贴原文',
     pasteOriginalConfirm: '确认粘贴未脱敏的原文？',
     btnCancel: '取消',
-    fallbackCopied: '已脱敏并复制，请按 Ctrl+V 粘贴',
-    fallbackFailed: '脱敏完成但写入剪贴板失败，请重试粘贴',
-    previewFailed: '预览未能显示，已按原文粘贴（可改用工作台脱敏）',
+    fallbackCopied: '无法自动回填，已复制脱敏结果。请再次粘贴。',
+    fallbackFailed: '无法回填或写入剪贴板，请重试粘贴或使用工作台',
+    previewFailed: '无法完成本次脱敏或显示预览，已阻止粘贴。请重试或使用工作台。',
+    originalCopied: '无法自动回填，已复制文本。请再次粘贴。',
   },
 } as const;
 

@@ -4,9 +4,9 @@
  * showTest（默认 true）控制末尾"样本即时预览"测试台——配置页的规则卡片
  * 传入 false 以精简布局，仅"添加规则"弹窗保留该测试台。
  */
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { DETECTOR_LIST } from '../../core/detectors';
-import { testRule } from '../../core/engine';
+import { startEngineJob } from '../../core/worker-job';
 import type { Rule } from '../../core/types';
 import { t } from '../../i18n';
 
@@ -26,27 +26,44 @@ export default function RuleForm({ rule, onChange, showTest = true }: Props) {
     rule.type === 'builtin' ? DETECTOR_LIST.find((d) => d.id === rule.pattern) : undefined;
 
   function update(patch: Partial<Rule>) {
-    const next = { ...rule, ...patch };
-    onChange(next);
-    if (showTest && sample) runTest(sample, next);
+    onChange({ ...rule, ...patch });
   }
 
-  function runTest(text: string, r: Rule) {
-    setSample(text);
-    if (!text) {
-      setTestOut('');
-      setTestErr('');
-      return;
-    }
-    try {
-      const res = testRule(text, r);
-      setTestOut(res.output);
-      setTestErr('');
-    } catch (err) {
-      setTestOut('');
-      setTestErr((err as Error).message);
-    }
-  }
+  useEffect(() => {
+    if (!showTest || !sample) return;
+    let cancelled = false;
+    let job: ReturnType<typeof startEngineJob> | undefined;
+    const timer = setTimeout(async () => {
+      try {
+        job = startEngineJob(
+          sample,
+          {
+            id: 'sample',
+            name: 'sample',
+            enabled: true,
+            isDefault: false,
+            createdAt: 0,
+            updatedAt: 0,
+            rules: [rule],
+          },
+          true,
+        );
+        const result = await job.result;
+        if (cancelled) return;
+        setTestOut(result.output);
+        setTestErr('');
+      } catch (err) {
+        if (cancelled) return;
+        setTestOut('');
+        setTestErr((err as Error).message === 'engine-timeout' ? '规则执行超时' : '无法运行此规则');
+      }
+    }, 150);
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+      job?.cancel();
+    };
+  }, [showTest, sample, rule]);
 
   return (
     <div className="space-y-1.5 text-sm">
@@ -185,7 +202,11 @@ export default function RuleForm({ rule, onChange, showTest = true }: Props) {
             className="min-w-0 flex-1 rounded border border-dashed border-[var(--vesper-border)] bg-transparent px-2 py-1 text-xs outline-none focus:border-black"
             placeholder={t.options.ruleTestPlaceholder}
             value={sample}
-            onChange={(e) => runTest(e.target.value, rule)}
+            onChange={(e) => {
+              setSample(e.target.value);
+              setTestOut('');
+              setTestErr('');
+            }}
           />
           {testErr && <span className="shrink-0 text-xs text-neutral-500">⚠ {testErr}</span>}
           {testOut && (

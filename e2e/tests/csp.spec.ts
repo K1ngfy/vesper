@@ -11,9 +11,12 @@
  * 注意：该页面会拒绝 addScriptTag 注入脚本（同样是 TT 限制），
  * 因此内容脚本用 addInitScript 走 CDP 注入（与浏览器原生注入行为一致）。
  */
+import { fileURLToPath } from 'node:url';
 import { test, expect } from '@playwright/test';
 
-const CONTENT_JS = '../.output/chrome-mv3/content-scripts/content.js';
+const CONTENT_JS = fileURLToPath(
+  new URL('../../.output/chrome-mv3/content-scripts/content.js', import.meta.url),
+);
 const FIXTURE = new URL('../fixtures/csp-tt.html', import.meta.url).pathname;
 
 function makeState(mode: 'auto' | 'preview') {
@@ -70,7 +73,7 @@ async function realPaste(
   await context.grantPermissions(['clipboard-read', 'clipboard-write']);
   await page.locator(selector).click();
   await page.evaluate((t) => navigator.clipboard.writeText(t), text);
-  await page.keyboard.press('Meta+V');
+  await page.keyboard.press('ControlOrMeta+V');
   await page.waitForTimeout(400);
 }
 

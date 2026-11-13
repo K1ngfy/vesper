@@ -1,7 +1,7 @@
 {
   "name": "vesper",
   "description": "VESPER — 粘贴之前，先过一遍暮星。本地优先的 AI 粘贴脱敏浏览器扩展。",
-  "version": "0.2.4",
+  "version": "0.2.5",
   "type": "module",
   "license": "MIT",
   "author": "K1ngfy",
@@ -20,7 +20,7 @@
     "format:check": "prettier --check .",
     "test": "vitest run",
     "test:watch": "vitest",
-    "e2e": "playwright test",
+    "e2e": "playwright test --config e2e/playwright.config.ts",
     "postinstall": "wxt prepare"
   },
   "dependencies": {

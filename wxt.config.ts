@@ -28,7 +28,15 @@ export default defineConfig({
     name: 'VESPER',
     description:
       '粘贴之前，先过一遍暮星。在文本进入 AI 平台前，于本机完成敏感信息脱敏。零服务器、零上传、零统计。',
-    permissions: ['storage', 'contextMenus', 'sidePanel', 'scripting', 'activeTab', 'clipboardWrite'],
+    permissions: [
+      'storage',
+      'contextMenus',
+      'sidePanel',
+      'scripting',
+      'activeTab',
+      'clipboardWrite',
+      'offscreen',
+    ],
     optional_host_permissions: ['*://*/*'],
     commands: {
       'open-workbench': {

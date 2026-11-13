@@ -237,9 +237,22 @@ describe('引擎通用行为', () => {
         },
       ],
     };
-    const res = desensitize('张三和李四', scheme);
-    expect(res.output).toBe('某人和某人');
+    const res = desensitize('张三和李四和李四', scheme);
+    expect(res.output).toBe('某人和某人和某人');
     expect(res.mapping['某人']).toBeUndefined();
+  });
+
+  it('保留输入中的私用区令牌并按输出位置排列命中', () => {
+    const literal = '\uE000\uE010\uE001';
+    const res = desensitize(literal + ' 13812345678 zhangsan@acme-tech.com', fixtureScheme());
+    expect(res.output).toBe(literal + ' [PHONE_1] [EMAIL_1]');
+    expect(res.hits.map((hit) => hit.index)).toEqual([4, 14]);
+  });
+
+  it('数据库密码与用户名相同时只替换密码', () => {
+    const rule = builtinRule('db_conn');
+    const res = testRule('postgres://same:same@example.test/db', rule);
+    expect(res.output).toBe('postgres://same:[PASSWORD_1]@example.test/db');
   });
 
   it('性能基线：100KB 文本 + 默认多规则 < 100ms', () => {

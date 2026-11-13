@@ -16,7 +16,13 @@ export const DETECTORS: Record<BuiltinDetectorId, Detector> = {
     id: 'email',
     name: '邮箱',
     description: '识别 name@company.com 形式的邮箱地址',
-    patterns: [{ source: '[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{2,}', flags: 'g' }],
+    patterns: [
+      {
+        source:
+          '(?<![A-Za-z0-9._%+-])[A-Za-z0-9._%+-]{1,64}@[A-Za-z0-9.-]{1,253}\\.[A-Za-z]{2,63}(?![A-Za-z0-9-])',
+        flags: 'g',
+      },
+    ],
     defaultReplacement: '[EMAIL_n]',
   },
 
@@ -163,5 +169,5 @@ export const DETECTORS: Record<BuiltinDetectorId, Detector> = {
 export const DETECTOR_LIST: Detector[] = Object.values(DETECTORS);
 
 export function getDetector(id: string): Detector | undefined {
-  return (DETECTORS as Record<string, Detector>)[id];
+  return Object.hasOwn(DETECTORS, id) ? (DETECTORS as Record<string, Detector>)[id] : undefined;
 }

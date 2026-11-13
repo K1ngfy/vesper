@@ -20,7 +20,7 @@ import {
   getSites,
   saveSites,
   getSettings,
-  saveSettings,
+  updateSettings,
   hostToOrigins,
 } from '../../storage';
 import { t } from '../../i18n';
@@ -34,9 +34,7 @@ function isValidHostPattern(input: string): boolean {
   if (!base || base.length > 253) return false;
   const labels = base.split('.');
   if (labels.length < 2) return false;
-  return labels.every(
-    (l) => /^[a-z0-9-]{1,63}$/.test(l) && !l.startsWith('-') && !l.endsWith('-'),
-  );
+  return labels.every((l) => /^[a-z0-9-]{1,63}$/.test(l) && !l.startsWith('-') && !l.endsWith('-'));
 }
 
 /** 表格列宽：选择 / 名称 / 域名 / 状态 / 方案 / 拦截模式 / 操作 */
@@ -45,13 +43,31 @@ const COLS = 'grid-cols-[24px_minmax(90px,1fr)_minmax(130px,1.2fr)_80px_150px_13
 type Filter = 'all' | SiteCategory;
 
 const EditIcon = (
-  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+  <svg
+    width="14"
+    height="14"
+    viewBox="0 0 24 24"
+    fill="none"
+    stroke="currentColor"
+    strokeWidth="2"
+    strokeLinecap="round"
+    strokeLinejoin="round"
+  >
     <path d="M12 20h9" />
     <path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4Z" />
   </svg>
 );
 const TrashIcon = (
-  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+  <svg
+    width="14"
+    height="14"
+    viewBox="0 0 24 24"
+    fill="none"
+    stroke="currentColor"
+    strokeWidth="2"
+    strokeLinecap="round"
+    strokeLinejoin="round"
+  >
     <path d="M3 6h18" />
     <path d="M8 6V4h8v2" />
     <path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6" />
@@ -100,6 +116,7 @@ export default function SitesTab() {
   const [excludeText, setExcludeText] = useState('');
   const excludeTimer = useRef<number | null>(null);
   const [globalGranted, setGlobalGranted] = useState(false);
+  const [grantedSites, setGrantedSites] = useState<Set<string>>(new Set());
   const [globalMode, setGlobalMode] = useState<SiteMode>('preview');
   const [notice, setNotice] = useState('');
   const [expanded, setExpanded] = useState<Record<string, boolean>>({});
@@ -124,8 +141,36 @@ export default function SitesTab() {
       setExcludeHosts(exclude);
       setExcludeText(exclude.join('\n'));
     });
-    void chrome.permissions.contains({ origins: ['*://*/*'] }).then(setGlobalGranted);
   }, []);
+
+  useEffect(() => {
+    let stopped = false;
+    async function refreshPermissions() {
+      const [global, granted] = await Promise.all([
+        chrome.permissions.contains({ origins: ['*://*/*'] }),
+        Promise.all(
+          sites.map(async (site) =>
+            (await chrome.permissions
+              .contains({ origins: hostToOrigins(site.host) })
+              .catch(() => false))
+              ? site.id
+              : null,
+          ),
+        ),
+      ]);
+      if (stopped) return;
+      setGlobalGranted(global);
+      setGrantedSites(new Set(granted.filter((id) => id !== null)));
+    }
+    void refreshPermissions();
+    chrome.permissions.onAdded.addListener(refreshPermissions);
+    chrome.permissions.onRemoved.addListener(refreshPermissions);
+    return () => {
+      stopped = true;
+      chrome.permissions.onAdded.removeListener(refreshPermissions);
+      chrome.permissions.onRemoved.removeListener(refreshPermissions);
+    };
+  }, [sites]);
 
   async function persistSites(next: SiteRule[]) {
     setSites(next);
@@ -134,10 +179,7 @@ export default function SitesTab() {
   }
 
   async function persistScope(next: SiteScope) {
-    const settings = await getSettings();
-    if (!settings) return;
-    settings.siteScope = next;
-    await saveSettings(settings);
+    await updateSettings({ siteScope: next });
     setScope(next);
     await sendMessage({ type: 'REFRESH_SITE_REGISTRATIONS' });
   }
@@ -155,20 +197,14 @@ export default function SitesTab() {
 
   async function persistExcludeHosts(next: string[]) {
     setExcludeHosts(next);
-    const settings = await getSettings();
-    if (!settings) return;
-    settings.excludeHosts = next;
-    await saveSettings(settings);
+    await updateSettings({ excludeHosts: next });
     // 保存后 content script 会因 storage 变更自动刷新判定，无需再注册
   }
 
   /** 全局模式拦截模式变更：写入 settings，content script 监听 storage 变化自动刷新 */
   async function persistGlobalMode(next: SiteMode) {
     setGlobalMode(next);
-    const settings = await getSettings();
-    if (!settings) return;
-    settings.globalMode = next;
-    await saveSettings(settings);
+    await updateSettings({ globalMode: next });
   }
 
   /** 停止输入 500ms 后落盘；失焦时立即落盘 */
@@ -191,7 +227,8 @@ export default function SitesTab() {
 
   /** 单个站点启停（状态列点击）：启用申请权限，停用交还权限 */
   async function toggleSite(site: SiteRule) {
-    if (!site.enabled) {
+    const enable = !site.enabled || !grantedSites.has(site.id);
+    if (enable) {
       const origins = hostToOrigins(site.host);
       const granted = await chrome.permissions.request({ origins });
       if (!granted) {
@@ -204,9 +241,7 @@ export default function SitesTab() {
       await chrome.permissions.remove({ origins }).catch(() => {});
       setNotice('');
     }
-    await persistSites(
-      sites.map((s) => (s.id === site.id ? { ...s, enabled: !s.enabled } : s)),
-    );
+    await persistSites(sites.map((s) => (s.id === site.id ? { ...s, enabled: enable } : s)));
   }
 
   function updateSite(id: string, patch: Partial<SiteRule>) {
@@ -269,7 +304,7 @@ export default function SitesTab() {
 
   /** 批量启用：一次性申请所有选中站点权限后启用 */
   async function batchEnable() {
-    const targets = sites.filter((s) => selected.has(s.id) && !s.enabled);
+    const targets = sites.filter((s) => selected.has(s.id));
     if (targets.length === 0) {
       clearSelection();
       return;
@@ -306,8 +341,7 @@ export default function SitesTab() {
 
   const filteredSites =
     filter === 'all' ? sites : sites.filter((s) => (s.category ?? 'custom') === filter);
-  const allSelected =
-    filteredSites.length > 0 && filteredSites.every((s) => selected.has(s.id));
+  const allSelected = filteredSites.length > 0 && filteredSites.every((s) => selected.has(s.id));
 
   function toggleSelectAll() {
     if (allSelected) setSelected(new Set());
@@ -319,7 +353,9 @@ export default function SitesTab() {
     const isOpen = expanded[site.id] ?? false;
     return (
       <div key={site.id} className="border-t border-[var(--vesper-border)]">
-        <div className={`grid ${COLS} items-center gap-3 px-3 py-2 transition-colors hover:bg-neutral-50`}>
+        <div
+          className={`grid ${COLS} items-center gap-3 px-3 py-2 transition-colors hover:bg-neutral-50`}
+        >
           <input
             type="checkbox"
             className="accent-black"
@@ -330,7 +366,9 @@ export default function SitesTab() {
             className="min-w-0 w-full rounded border border-transparent bg-transparent px-1.5 py-0.5 text-sm outline-none hover:border-[var(--vesper-border)] focus:border-black"
             value={site.name ?? ''}
             onChange={(e) => updateSite(site.id, { name: e.target.value })}
-            placeholder={SITE_DISPLAY_NAMES[normalizeHost(site.host)] ?? t.options.siteNamePlaceholder}
+            placeholder={
+              SITE_DISPLAY_NAMES[normalizeHost(site.host)] ?? t.options.siteNamePlaceholder
+            }
           />
           <span
             className="min-w-0 truncate font-mono text-xs text-[var(--vesper-text-dim)]"
@@ -339,9 +377,9 @@ export default function SitesTab() {
             {site.host}
           </span>
           <Toggle
-            checked={site.enabled}
+            checked={site.enabled && grantedSites.has(site.id)}
             onChange={() => void toggleSite(site)}
-            title={site.enabled ? t.common.disable : t.common.enable}
+            title={site.enabled && grantedSites.has(site.id) ? t.common.disable : t.common.enable}
           />
           <select
             className="w-full rounded border border-[var(--vesper-border)] bg-white px-1.5 py-1 text-xs"
@@ -382,7 +420,9 @@ export default function SitesTab() {
           </div>
         </div>
         {isOpen && (
-          <div className={`grid ${COLS} items-center gap-3 border-t border-dashed border-[var(--vesper-border)] bg-neutral-50 px-3 py-2 text-xs`}>
+          <div
+            className={`grid ${COLS} items-center gap-3 border-t border-dashed border-[var(--vesper-border)] bg-neutral-50 px-3 py-2 text-xs`}
+          >
             <div />
             <div className="col-span-2 space-y-1">
               <p className="text-[var(--vesper-text-dim)]">{t.options.selectorHelp}</p>
@@ -390,9 +430,7 @@ export default function SitesTab() {
                 className="w-full rounded border border-[var(--vesper-border)] bg-white px-1.5 py-1 font-mono"
                 placeholder="CSS 选择器，如 div#chat-input textarea"
                 value={site.selector ?? ''}
-                onChange={(e) =>
-                  updateSite(site.id, { selector: e.target.value || undefined })
-                }
+                onChange={(e) => updateSite(site.id, { selector: e.target.value || undefined })}
               />
             </div>
             <div />
@@ -504,7 +542,9 @@ export default function SitesTab() {
           {/* 例外主机 */}
           <div>
             <h4 className="mb-1 text-sm font-medium">{t.options.excludeListTitle}</h4>
-            <p className="mb-1 text-xs text-[var(--vesper-text-dim)]">{t.options.excludeListHint}</p>
+            <p className="mb-1 text-xs text-[var(--vesper-text-dim)]">
+              {t.options.excludeListHint}
+            </p>
             <p className="mb-2 text-[11px] text-[var(--vesper-text-dim)]">
               {t.options.excludeListTip}
             </p>
@@ -641,7 +681,9 @@ export default function SitesTab() {
             <h3 className="mb-4 text-sm font-semibold">{t.options.addSiteTitle}</h3>
             <div className="space-y-3 text-sm">
               <label className="block">
-                <span className="mb-1 block text-xs text-[var(--vesper-text-dim)]">{t.options.fieldName}</span>
+                <span className="mb-1 block text-xs text-[var(--vesper-text-dim)]">
+                  {t.options.fieldName}
+                </span>
                 <input
                   className="w-full rounded-md border border-[var(--vesper-border)] px-3 py-2"
                   value={draft.name}
@@ -650,7 +692,9 @@ export default function SitesTab() {
                 />
               </label>
               <label className="block">
-                <span className="mb-1 block text-xs text-[var(--vesper-text-dim)]">{t.options.fieldHost}</span>
+                <span className="mb-1 block text-xs text-[var(--vesper-text-dim)]">
+                  {t.options.fieldHost}
+                </span>
                 <input
                   className="w-full rounded-md border border-[var(--vesper-border)] px-3 py-2 font-mono"
                   value={draft.host}
@@ -664,11 +708,15 @@ export default function SitesTab() {
               </label>
               <div className="grid grid-cols-2 gap-3">
                 <label className="block">
-                  <span className="mb-1 block text-xs text-[var(--vesper-text-dim)]">{t.options.fieldCategory}</span>
+                  <span className="mb-1 block text-xs text-[var(--vesper-text-dim)]">
+                    {t.options.fieldCategory}
+                  </span>
                   <select
                     className="w-full rounded-md border border-[var(--vesper-border)] bg-white px-2 py-2"
                     value={draft.category}
-                    onChange={(e) => setDraft({ ...draft, category: e.target.value as SiteCategory })}
+                    onChange={(e) =>
+                      setDraft({ ...draft, category: e.target.value as SiteCategory })
+                    }
                   >
                     {SITE_CATEGORY_ORDER.map((c) => (
                       <option key={c} value={c}>
@@ -691,7 +739,9 @@ export default function SitesTab() {
                 </label>
               </div>
               <label className="block">
-                <span className="mb-1 block text-xs text-[var(--vesper-text-dim)]">{t.options.bindScheme}</span>
+                <span className="mb-1 block text-xs text-[var(--vesper-text-dim)]">
+                  {t.options.bindScheme}
+                </span>
                 <select
                   className="w-full rounded-md border border-[var(--vesper-border)] bg-white px-2 py-2"
                   value={draft.schemeId}

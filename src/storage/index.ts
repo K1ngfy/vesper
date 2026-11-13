@@ -21,6 +21,7 @@ import {
   PRESET_HOST_CATEGORY,
   PRESET_SITES,
 } from '../core/presets';
+import { getDetector } from '../core/detectors';
 import type { Scheme, SiteMode, SiteRule, SiteScope } from '../core/types';
 
 export interface Settings {
@@ -51,6 +52,7 @@ const KEYS = {
   settings: 'vesper:settings',
   mappings: 'vesper:mappings',
   meta: 'vesper:meta',
+  count: 'vesper:dailyCount',
 } as const;
 
 async function get<T>(key: string): Promise<T | undefined> {
@@ -242,13 +244,19 @@ export async function findSiteByUrl(url: string): Promise<SiteRule | undefined> 
   const sites = await getSites();
   const host = urlToHost(url);
   if (!host) return undefined;
-  return sites.find((s) => hostMatches(host, s.host));
+  return sites.reduce<SiteRule | undefined>((match, site) => {
+    if (!hostMatches(host, site.host)) return match;
+    const specificity = (rule: SiteRule) =>
+      rule.host.trim() === '*' ? 0 : normalizeHost(rule.host).length;
+    return !match || specificity(site) > specificity(match) ? site : match;
+  }, undefined);
 }
 
 /** 从 URL 提取 hostname（小写） */
 export function urlToHost(url: string): string {
   try {
-    return new URL(url).hostname.toLowerCase();
+    const parsed = new URL(url);
+    return ['http:', 'https:'].includes(parsed.protocol) ? parsed.hostname : '';
   } catch {
     return '';
   }
@@ -270,14 +278,16 @@ function ipv4ToInt(ip: string): number | null {
 
 /** host 是否落在 IPv4 CIDR 网段内（如 192.168.0.0/16）；非 IPv4 一律不命中 */
 function ipv4InCidr(host: string, cidr: string): boolean {
-  const [base = '', bitsRaw] = cidr.split('/');
+  const match = /^([\d.]+)\/(\d{1,2})$/.exec(cidr);
+  if (!match) return false;
+  const [, base = '', bitsRaw] = match;
   const bits = Number(bitsRaw);
   if (!Number.isInteger(bits) || bits < 0 || bits > 32) return false;
   const baseInt = ipv4ToInt(base);
   const hostInt = ipv4ToInt(host);
   if (baseInt == null || hostInt == null) return false;
   const mask = bits === 0 ? 0 : (0xffffffff << (32 - bits)) >>> 0;
-  return ((baseInt & mask) >>> 0) === ((hostInt & mask) >>> 0);
+  return (baseInt & mask) >>> 0 === (hostInt & mask) >>> 0;
 }
 
 /** 去掉 IPv6 字面量的方括号：URL.hostname 给的是 [::1]，用户可能写 ::1 */
@@ -295,7 +305,7 @@ export function hostMatches(host: string, ruleHost: string): boolean {
   if (!host || !ruleHost) return false;
   const rule = ruleHost.trim().toLowerCase();
   if (rule === '*') return true;
-  const h = host.trim().toLowerCase();
+  const h = host.trim().toLowerCase().replace(/\.$/, '');
   if (rule.includes('/')) return ipv4InCidr(h, rule);
   const base = normalizeHost(rule);
   if (h.startsWith('[') || base.startsWith('[')) return stripBrackets(h) === stripBrackets(base);
@@ -304,8 +314,10 @@ export function hostMatches(host: string, ruleHost: string): boolean {
 
 /** 由 host 派生 origin（根域 + 子域两条；'*' 派生全局一条），用于权限申请与 content script 注册 */
 export function hostToOrigins(host: string): string[] {
-  if (host === '*') return ['*://*/*'];
   const base = normalizeHost(host);
+  if (base === '*') return ['*://*/*'];
+  if (ipv4ToInt(base) !== null || base.startsWith('[') || base === 'localhost')
+    return [`*://${base}/*`];
   return [`*://${base}/*`, `*://*.${base}/*`];
 }
 
@@ -321,26 +333,32 @@ export async function getSettings(): Promise<Settings | undefined> {
   return get<Settings>(KEYS.settings);
 }
 
-export async function saveSettings(settings: Settings): Promise<void> {
-  await set(KEYS.settings, settings);
+export async function updateSettings(patch: Partial<Settings>): Promise<void> {
+  return navigator.locks.request('vesper:settings', async () => {
+    const current = await getSettings();
+    if (current) await set(KEYS.settings, { ...current, ...patch });
+  });
 }
 
 // ---------- 计数（仅本地，文档 4.5） ----------
 
+async function readCount(): Promise<Settings['dailyCount'] | undefined> {
+  return (await get<Settings['dailyCount']>(KEYS.count)) ?? (await getSettings())?.dailyCount;
+}
+
 export async function incrementDailyCount(by = 1): Promise<number> {
-  const settings = await getSettings();
-  if (!settings) return 0;
-  const d = today();
-  const count = settings.dailyCount.date === d ? settings.dailyCount.count + by : by;
-  settings.dailyCount = { date: d, count };
-  await saveSettings(settings);
-  return count;
+  return navigator.locks.request('vesper:count', async () => {
+    const previous = await readCount();
+    const date = today();
+    const count = previous?.date === date ? previous.count + by : by;
+    await set(KEYS.count, { date, count });
+    return count;
+  });
 }
 
 export async function getDailyCount(): Promise<number> {
-  const settings = await getSettings();
-  if (!settings || settings.dailyCount.date !== today()) return 0;
-  return settings.dailyCount.count;
+  const record = await readCount();
+  return record?.date === today() ? record.count : 0;
 }
 
 // ---------- 映射（文档 4.7：默认不持久化） ----------
@@ -350,13 +368,12 @@ export async function getMappings(): Promise<MappingRecord[]> {
 }
 
 export async function pushMapping(rec: MappingRecord): Promise<void> {
-  // 最近一次映射始终写入 session（供右键还原 / 工作台还原；关闭浏览器即销毁）
-  await chrome.storage.session.set({ 'vesper:lastMapping': rec });
-  const settings = await getSettings();
-  if (!settings?.persistMappings) return; // 默认关：不持久化到 local
-  const list = await getMappings();
-  list.unshift(rec);
-  await set(KEYS.mappings, list.slice(0, 20)); // 最多保留 20 次
+  return navigator.locks.request('vesper:mappings', async () => {
+    await chrome.storage.session.set({ 'vesper:lastMapping': rec });
+    if (!(await getSettings())?.persistMappings) return;
+    const list = await getMappings();
+    await set(KEYS.mappings, [rec, ...list.slice(0, 19)]);
+  });
 }
 
 /** 读取最近一次脱敏映射（session，供右键还原；persistMappings 关闭时也可用） */
@@ -400,32 +417,93 @@ export function validateImport(data: unknown): string | null {
   if (typeof data !== 'object' || data == null) return '文件不是合法的 JSON 对象';
   const d = data as Partial<ExportBundle>;
   if (d.app !== 'vesper') return '不是 VESPER 导出的文件';
+  if (
+    !Number.isInteger(d.schemaVersion) ||
+    d.schemaVersion! < 1 ||
+    d.schemaVersion! > SCHEMA_VERSION
+  ) {
+    return '不支持此备份版本';
+  }
+  const settings = d.settings;
+  const modes = ['preview', 'auto', 'warn-only'];
+  if (
+    !settings ||
+    typeof settings.globalEnabled !== 'boolean' ||
+    typeof settings.activeSchemeId !== 'string' ||
+    typeof settings.persistMappings !== 'boolean' ||
+    (settings.siteScope !== undefined && !['list', 'global'].includes(settings.siteScope)) ||
+    (settings.globalMode !== undefined && !modes.includes(settings.globalMode)) ||
+    (settings.excludeHosts !== undefined &&
+      (!Array.isArray(settings.excludeHosts) ||
+        settings.excludeHosts.some((h) => typeof h !== 'string')))
+  ) {
+    return '设置结构不合法';
+  }
   if (!Array.isArray(d.schemes)) return '缺少方案列表';
+  const schemeIds = new Set<string>();
   for (const s of d.schemes) {
     if (
       typeof s?.id !== 'string' ||
-      typeof s?.name !== 'string' ||
-      typeof s?.enabled !== 'boolean' ||
-      !Array.isArray(s?.rules)
+      !s.id ||
+      schemeIds.has(s.id) ||
+      typeof s.name !== 'string' ||
+      typeof s.enabled !== 'boolean' ||
+      typeof s.isDefault !== 'boolean' ||
+      !Array.isArray(s.rules)
     ) {
       return '方案结构不合法';
     }
+    schemeIds.add(s.id);
+    const ruleIds = new Set<string>();
     for (const r of s.rules) {
       if (
         typeof r?.id !== 'string' ||
-        !['keyword', 'regex', 'builtin'].includes(r?.type) ||
-        typeof r?.pattern !== 'string' ||
-        !['fixed', 'numbered', 'mask'].includes(r?.mode)
+        !r.id ||
+        ruleIds.has(r.id) ||
+        typeof r.name !== 'string' ||
+        typeof r.enabled !== 'boolean' ||
+        typeof r.pattern !== 'string' ||
+        typeof r.replacement !== 'string' ||
+        !['keyword', 'regex', 'builtin'].includes(r.type) ||
+        !['fixed', 'numbered', 'mask'].includes(r.mode) ||
+        (r.regexFlags !== undefined && typeof r.regexFlags !== 'string') ||
+        [r.caseSensitive, r.wholeWord, r.maskKeepDomain].some(
+          (v) => v !== undefined && typeof v !== 'boolean',
+        ) ||
+        (r.maskKeep !== undefined &&
+          (!r.maskKeep ||
+            ![r.maskKeep.head, r.maskKeep.tail].every((n) => Number.isSafeInteger(n) && n >= 0)))
       ) {
-        return `规则结构不合法：${r?.name ?? r?.id ?? '未知规则'}`;
+        return '规则结构不合法';
       }
+      if (r.type === 'builtin' && !getDetector(r.pattern)) return '未知的内置检测器';
+      if (r.type === 'regex') {
+        try {
+          new RegExp(r.pattern, r.regexFlags);
+        } catch {
+          return '规则中包含无效的正则表达式';
+        }
+      }
+      ruleIds.add(r.id);
     }
   }
   if (!Array.isArray(d.sites)) return '缺少站点列表';
+  const siteIds = new Set<string>();
   for (const s of d.sites) {
-    if (typeof s?.id !== 'string' || typeof s?.host !== 'string') {
+    if (
+      typeof s?.id !== 'string' ||
+      !s.id ||
+      siteIds.has(s.id) ||
+      typeof s.host !== 'string' ||
+      !s.host.trim() ||
+      typeof s.enabled !== 'boolean' ||
+      typeof s.schemeId !== 'string' ||
+      !modes.includes(s.mode) ||
+      (s.selector !== undefined && typeof s.selector !== 'string')
+    ) {
       return '站点结构不合法';
     }
+    siteIds.add(s.id);
   }
   return null;
 }
@@ -433,19 +511,32 @@ export function validateImport(data: unknown): string | null {
 export async function importAll(bundle: ExportBundle): Promise<void> {
   const err = validateImport(bundle);
   if (err) throw new Error(err);
-  await set(KEYS.schemes, bundle.schemes);
-  await set(KEYS.sites, bundle.sites);
-  const current = await getSettings();
-  await saveSettings({
-    ...bundle.settings,
-    // 兼容老版本导出文件（无 globalMode 字段时补默认值）
-    globalMode: bundle.settings.globalMode ?? 'preview',
-    dailyCount: current?.dailyCount ?? { date: today(), count: 0 },
+  await navigator.locks.request('vesper:settings', async () => {
+    const current = await getSettings();
+    const settings: Settings = {
+      ...bundle.settings,
+      siteScope: bundle.settings.siteScope ?? 'list',
+      globalMode: bundle.settings.globalMode ?? 'preview',
+      excludeHosts: bundle.settings.excludeHosts ?? [...DEFAULT_EXCLUDE_HOSTS],
+      dailyCount: current?.dailyCount ?? { date: today(), count: 0 },
+    };
+    await chrome.storage.local.set({
+      [KEYS.schemes]: bundle.schemes,
+      [KEYS.sites]: bundle.sites,
+      [KEYS.settings]: settings,
+    });
   });
 }
 
 /** 一键清除全部本地数据（文档 4.4） */
 export async function clearAll(): Promise<void> {
-  await chrome.storage.local.clear();
-  await ensureSeeded();
+  await navigator.locks.request('vesper:settings', () =>
+    navigator.locks.request('vesper:count', () =>
+      navigator.locks.request('vesper:mappings', async () => {
+        await chrome.storage.session.remove(['vesper:lastMapping', 'vesper:pendingInput']);
+        await chrome.storage.local.clear();
+        await ensureSeeded();
+      }),
+    ),
+  );
 }
