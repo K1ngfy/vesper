@@ -10,8 +10,7 @@
  * 护栏（硬性）：
  * - 密码框、不可编辑区域、VESPER 自身 UI 内永不拦截；
  * - 只处理 text/plain；图片/文件粘贴不受影响；
- * - 回填用 insertText（不触发 paste/drop 事件），天然无递归拦截风险，
- *   不打任何时间窗标记——避免误伤用户的快速连续粘贴；
+ * - 回填由扩展完成。编辑器收到的合成粘贴事件不会再次触发拦截；
  * - 同步检查无命中时保留站点默认粘贴。
  */
 import { desensitize } from '@/src/core/engine';
@@ -19,7 +18,7 @@ import type { DesensitizeResult, Scheme, SiteRule } from '@/src/core/types';
 import { ENGINE_PORT, sendMessage } from '@/src/messages';
 import { pickAdapter } from '@/src/content/adapters';
 import { captureInsertion } from '@/src/content/insert';
-import { closePreview, isOwnUI, showPreview, showToast } from '@/src/content/ui';
+import { closePreview, isOwnUI, showPreview, showProcessing, showToast } from '@/src/content/ui';
 import { t } from '@/src/i18n';
 
 interface Ctx {
@@ -109,32 +108,54 @@ function onDrop(e: DragEvent, adapter: Adapter): void {
 }
 
 const WORKER_THRESHOLD = 12 * 1024;
+const MIN_PROCESSING_DISPLAY_MS = 300;
 
-async function desensitizeInExtension(text: string, scheme: Scheme): Promise<DesensitizeResult> {
-  if (!(await sendMessage({ type: 'ENSURE_ENGINE' }))) throw new Error('engine-unavailable');
+function desensitizeInExtension(text: string, scheme: Scheme): Promise<DesensitizeResult> {
   return new Promise((resolve, reject) => {
-    const port = chrome.runtime.connect({ name: ENGINE_PORT });
-    const timer = setTimeout(() => {
-      port.disconnect();
-      reject(new Error('engine-timeout'));
-    }, 12_000);
-    port.onDisconnect.addListener(() => {
+    let port: chrome.runtime.Port | undefined;
+    let settled = false;
+    const finish = () => {
+      settled = true;
       clearTimeout(timer);
-      reject(new Error('engine-disconnected'));
-    });
-    port.onMessage.addListener((result: DesensitizeResult) => {
-      clearTimeout(timer);
-      port.disconnect();
-      resolve(result);
-    });
-    try {
-      port.postMessage({ text, scheme });
-    } catch (error) {
-      clearTimeout(timer);
-      port.disconnect();
+      port?.disconnect();
+    };
+    const fail = (error: unknown) => {
+      if (settled) return;
       reject(error);
-    }
+      finish();
+    };
+    // Include extension page startup in the deadline so the modal always unlocks.
+    const timer = setTimeout(() => fail(new Error('engine-timeout')), 12_000);
+    void sendMessage({ type: 'ENSURE_ENGINE' })
+      .then((ready) => {
+        if (settled) return;
+        if (!ready) throw new Error('engine-unavailable');
+        port = chrome.runtime.connect({ name: ENGINE_PORT });
+        port.onDisconnect.addListener(() => fail(new Error('engine-disconnected')));
+        port.onMessage.addListener((result: DesensitizeResult) => {
+          if (settled) return;
+          resolve(result);
+          finish();
+        });
+        port.postMessage({ text, scheme });
+      })
+      .catch(fail);
   });
+}
+
+async function runPasteEngine(text: string, scheme: Scheme): Promise<DesensitizeResult> {
+  const close = showProcessing();
+  // A warm worker can finish before the browser paints the modal.
+  const visibleUntil = performance.now() + MIN_PROCESSING_DISPLAY_MS;
+  try {
+    return await desensitizeInExtension(text, scheme);
+  } finally {
+    const remaining = visibleUntil - performance.now();
+    if (remaining > 0 && document.visibilityState === 'visible') {
+      await new Promise<void>((resolve) => setTimeout(resolve, remaining));
+    }
+    close();
+  }
 }
 
 function handleIntercept(text: string | undefined, event: Event, adapter: Adapter): void {
@@ -187,7 +208,7 @@ async function processPaste(
   const mode = current.site.mode;
   let awaitingConfirmation = false;
   try {
-    const res = result ?? (await desensitizeInExtension(original, current.scheme));
+    const res = result ?? (await runPasteEngine(original, current.scheme));
     if (result) await new Promise<void>((resolve) => setTimeout(resolve, 0));
     if (ctx !== current || (mode === 'preview' && id !== previewId)) return;
     if (res.hits.length === 0 || mode === 'warn-only') {
@@ -227,22 +248,46 @@ async function insertOrCopy(
   text: string,
   redacted: boolean,
 ): Promise<boolean> {
+  const current = ctx;
+  const id = previewId;
+  let dismissProgress: (() => void) | undefined;
+  const progress = setTimeout(() => {
+    if (ctx === current && previewId === id) {
+      dismissProgress = showToast(t.content.inserting, { persistent: true });
+    }
+  }, 200);
+  let offset = 0;
   try {
-    if (insertion.insert(text)) return true;
+    const remaining = await insertion.insert(text, () => ctx === current && previewId === id);
+    if (remaining === null) return true;
+    offset = remaining;
   } catch {
     // The destination may have changed while the preview was open.
+  } finally {
+    clearTimeout(progress);
+    dismissProgress?.();
   }
-  const current = ctx;
+  // A newer paste owns the clipboard. A partial write must never copy the prefix again.
+  if (previewId !== id) return false;
+  const remaining = text.slice(offset);
   try {
-    await navigator.clipboard.writeText(text);
+    await navigator.clipboard.writeText(remaining);
+    if (previewId !== id) return false;
     if (ctx === current) {
       clearApproval();
-      approvedPaste = { target: insertion.target, text, expires: Date.now() + 60_000 };
+      approvedPaste = { target: insertion.target, text: remaining, expires: Date.now() + 60_000 };
       approvalTimer = setTimeout(clearApproval, 60_000);
     }
-    showToast(redacted ? t.content.fallbackCopied : t.content.originalCopied);
+    showToast(
+      offset > 0
+        ? t.content.partialCopied
+        : redacted
+          ? t.content.fallbackCopied
+          : t.content.originalCopied,
+    );
   } catch {
-    showToast(t.content.fallbackFailed);
+    if (previewId === id)
+      showToast(offset > 0 ? t.content.partialFailed : t.content.fallbackFailed);
   }
   return false;
 }

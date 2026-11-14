@@ -52,11 +52,20 @@ const BASE_STYLE = `
 
   .dialog { width: min(560px, 90vw); max-height: 80vh; overflow: auto; padding: 20px; margin: auto; }
   .dialog::backdrop { background: rgba(0,0,0,.45); }
-  .title { font-size: 16px; font-weight: 600; margin-bottom: 4px; }
+  .preview[open] { display: flex; flex-direction: column; overflow: hidden; }
+  .processing { width: min(260px, 90vw); padding: 24px; text-align: center; font-size: 14px; }
+  .spinner {
+    width: 26px; height: 26px; margin: 0 auto 12px; border: 2px solid #e5e5e5;
+    border-top-color: #111111; border-radius: 50%; animation: spin .8s linear infinite;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  @media (prefers-reduced-motion: reduce) { .spinner { animation: none; } }
+  .title { flex: none; font-size: 16px; font-weight: 600; margin-bottom: 4px; }
   .title .hint { font-size: 12px; color: #6b7280; font-weight: 400; margin-left: 6px; }
-  .rows { margin: 12px 0; }
+  .rows { min-height: 0; overflow-y: auto; overscroll-behavior: contain; margin: 12px 0; }
+  .footer { flex: none; display: grid; gap: 12px; border-top: 1px solid #e5e5e5; padding-top: 12px; }
   .more { color: #6b7280; font-size: 12px; }
-  .actions { display: flex; gap: 10px; justify-content: flex-end; margin-top: 16px; }
+  .actions { display: flex; flex-wrap: wrap; gap: 10px; justify-content: flex-end; }
   .toast {
     position: fixed; right: 16px; bottom: 16px; z-index: 2147483647;
     padding: 12px 16px; display: flex; gap: 12px; align-items: center; font-size: 13px;
@@ -72,6 +81,37 @@ function makeButton(label: string, act: string, cls: string): HTMLButtonElement 
   return btn;
 }
 
+export function showProcessing(): () => void {
+  const shadow = ensureHost();
+  dismissToast?.();
+  const dialog = document.createElement('dialog');
+  dialog.className = 'panel dialog processing';
+  dialog.setAttribute('aria-label', t.content.processing);
+  for (const type of ['cancel', 'paste', 'drop', 'wheel']) {
+    dialog.addEventListener(type, (event) => event.preventDefault(), { passive: false });
+  }
+
+  const spinner = document.createElement('div');
+  spinner.className = 'spinner';
+  spinner.setAttribute('aria-hidden', 'true');
+  const status = document.createElement('div');
+  status.setAttribute('role', 'status');
+  status.textContent = t.content.processing;
+  dialog.append(spinner, status);
+  shadow.appendChild(dialog);
+  const close = () => {
+    dialog.close();
+    dialog.remove();
+  };
+  try {
+    dialog.showModal();
+  } catch (error) {
+    close();
+    throw error;
+  }
+  return close;
+}
+
 export interface PreviewActions {
   onConfirm: () => void;
   onPasteOriginal: () => void;
@@ -85,7 +125,7 @@ export function showPreview(res: DesensitizeResult, actions: PreviewActions): vo
   dismissToast?.();
 
   const dialog = document.createElement('dialog');
-  dialog.className = 'panel dialog';
+  dialog.className = 'panel dialog preview';
   dialog.setAttribute('aria-label', t.content.previewTitle);
 
   const title = document.createElement('div');
@@ -99,6 +139,9 @@ export function showPreview(res: DesensitizeResult, actions: PreviewActions): vo
 
   const rows = document.createElement('div');
   rows.className = 'rows';
+  rows.tabIndex = 0;
+  rows.setAttribute('role', 'region');
+  rows.setAttribute('aria-label', t.content.previewList);
   // Keep the sensitive strings out of the page-accessible shadow tree.
   const details = rows.attachShadow({ mode: 'closed' });
   const sheet = new CSSStyleSheet();
@@ -122,11 +165,13 @@ export function showPreview(res: DesensitizeResult, actions: PreviewActions): vo
   }
   dialog.appendChild(rows);
 
+  const footer = document.createElement('div');
+  footer.className = 'footer';
   if (res.hits.length > 50) {
     const more = document.createElement('div');
     more.className = 'more';
     more.textContent = `… 共 ${res.hits.length} 处，仅展示前 50 条`;
-    dialog.appendChild(more);
+    footer.appendChild(more);
   }
 
   const actionBar = document.createElement('div');
@@ -135,7 +180,8 @@ export function showPreview(res: DesensitizeResult, actions: PreviewActions): vo
   const originalBtn = makeButton(t.content.btnPasteOriginal, 'original', 'btn danger');
   const confirmBtn = makeButton(t.content.btnDesensitizedPaste, 'confirm', 'btn');
   actionBar.append(cancelBtn, originalBtn, confirmBtn);
-  dialog.appendChild(actionBar);
+  footer.appendChild(actionBar);
+  dialog.appendChild(footer);
 
   cancelBtn.autofocus = true;
   confirmBtn.addEventListener('click', (event) => {
@@ -178,10 +224,11 @@ export function closePreview(): void {
 export interface ToastActions {
   onUndo?: () => void;
   onDismiss?: () => void;
+  persistent?: boolean;
 }
 
 /** Toast：右下角浮层，6 秒自动消失，可带撤销 */
-export function showToast(message: string, actions: ToastActions = {}): void {
+export function showToast(message: string, actions: ToastActions = {}): () => void {
   const shadow = ensureHost();
   dismissToast?.();
 
@@ -190,6 +237,7 @@ export function showToast(message: string, actions: ToastActions = {}): void {
   toast.className = 'panel toast';
 
   const text = document.createElement('span');
+  text.setAttribute('role', 'status');
   text.textContent = `✳ ${message}`;
   toast.appendChild(text);
 
@@ -206,9 +254,12 @@ export function showToast(message: string, actions: ToastActions = {}): void {
     toast.appendChild(undo);
   }
   shadow.appendChild(toast);
-  const timer = setTimeout(dismiss, 6000);
+  const timer = actions.persistent ? undefined : setTimeout(dismiss, 6000);
   dismissToast = dismiss;
+  return dismiss;
+
   function dismiss() {
+    if (dismissToast !== dismiss) return;
     clearTimeout(timer);
     toast.remove();
     actions.onDismiss?.();

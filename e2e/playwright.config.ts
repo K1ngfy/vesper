@@ -12,6 +12,9 @@ import { defineConfig } from '@playwright/test';
 export default defineConfig({
   testDir: './tests',
   timeout: 30000,
+  // 粘贴用例通过 navigator.clipboard 写真实系统剪贴板，多 worker 并行会互相覆盖，
+  // 偶发读到别的用例的文本；串行执行可根治该串扰。
+  workers: 1,
   use: {
     headless: false,
   },
