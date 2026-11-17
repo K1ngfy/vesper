@@ -5,15 +5,19 @@
  * 行为要点：
  * - 输入即脱敏（防抖 150ms）；大文本和自定义正则走 Web Worker。
  * - 结果区高亮被替换片段，悬停显示原值与命中规则名（原值仅本地显示）。
- * - 还原模式：映射仅保存于本组件内存（session 级），关闭页面即销毁；
- *   同时上报 background（仅当用户在设置中开启本地保留时才落盘）。
+ * - 还原模式：跟随当前浏览器会话内最近一次脱敏的映射，按设置决定是否跨会话保留。
  */
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { desensitize } from '../core/engine';
-import { restoreWithMarks } from '../core/restore';
+import { createRestorer } from '../core/restore';
 import type { DesensitizeResult, Scheme } from '../core/types';
 import { sendMessage } from '../messages';
-import { getLastMapping, getMappings, getSettings } from '../storage';
+import {
+  getLatestMapping,
+  LAST_MAPPING_KEY,
+  MAPPING_HISTORY_KEY,
+  type MappingRecord,
+} from '../storage';
 import { t } from '../i18n';
 import { startEngineJob } from '../core/worker-job';
 
@@ -38,10 +42,8 @@ export default function WorkbenchApp() {
   const [notice, setNotice] = useState('');
   const [dragOver, setDragOver] = useState(false);
 
-  // 最近一次映射（文档 4.7）：用 state 而非 ref，使映射更新后还原模式的
-  // useMemo 能正确重算——之前用 ref 时映射变化不触发重渲染，还原模式拿到的
-  // 是旧值，且重开工作台后映射恒空，导致"还原模式没反应"。
   const [lastMapping, setLastMapping] = useState<Record<string, string>>({});
+  const mappingRevision = useRef(0);
 
   const resultRef = useRef<HTMLDivElement>(null);
 
@@ -53,20 +55,39 @@ export default function WorkbenchApp() {
   const res =
     completed && completed.input === input && completed.scheme === scheme ? completed.result : null;
 
-  // 初始化：取方案列表 + 右键菜单带入的文本 + （开启本地保留时）恢复最近映射
+  // 订阅先于读取，防止启动时较旧的读取结果覆盖网页刚写入的最新映射。
+  useEffect(() => {
+    const onChange = (changes: Record<string, chrome.storage.StorageChange>, area: string) => {
+      const change = changes[LAST_MAPPING_KEY];
+      const history = changes[MAPPING_HISTORY_KEY];
+      if (area === 'local' && history && history.newValue === undefined) {
+        mappingRevision.current += 1;
+        setLastMapping({});
+      }
+      if (area !== 'session' || !change) return;
+      mappingRevision.current += 1;
+      setLastMapping((change.newValue as MappingRecord | undefined)?.mapping ?? {});
+    };
+    chrome.storage.onChanged.addListener(onChange);
+    const revision = ++mappingRevision.current;
+    void getLatestMapping()
+      .then((record) => {
+        if (revision === mappingRevision.current) setLastMapping(record?.mapping ?? {});
+      })
+      .catch(() => {});
+    return () => {
+      mappingRevision.current += 1;
+      chrome.storage.onChanged.removeListener(onChange);
+    };
+  }, []);
+
+  // 初始化：取方案列表和右键菜单带入的文本。
   useEffect(() => {
     void (async () => {
       const list = await sendMessage({ type: 'GET_SCHEMES' });
       setSchemes(list);
       const active = await sendMessage({ type: 'GET_ACTIVE_SCHEME' });
       if (active) setSchemeId(active.id);
-      // 若用户在设置中开启了"保存映射到本地"，恢复最近一次映射，
-      // 否则重开工作台后还原模式恒空映射、无法还原。
-      const [last, settings] = await Promise.all([getLastMapping(), getSettings()]);
-      const mapping =
-        last?.mapping ??
-        (settings?.persistMappings ? (await getMappings())[0]?.mapping : undefined);
-      if (mapping) setLastMapping(mapping);
       const pending = await chrome.storage.session.get('vesper:pendingInput');
       const text = pending['vesper:pendingInput'];
       if (typeof text === 'string' && text) {
@@ -89,7 +110,8 @@ export default function WorkbenchApp() {
         const result = job ? await job.result : desensitize(input, scheme, true);
         if (cancelled) return;
         setCompleted({ input, scheme, result });
-        if (Object.keys(result.mapping).length > 0) {
+        if (result.hits.length > 0) {
+          mappingRevision.current += 1;
           setLastMapping(result.mapping);
           void sendMessage({
             type: 'RECORD_MAPPING',
@@ -109,10 +131,13 @@ export default function WorkbenchApp() {
   }, [input, scheme]);
 
   // 还原结果：output 为纯文本（供复制），marks 标记每个被还原片段位置（供高亮）
+  const restoreText = useMemo(
+    () => (mode === 'restore' ? createRestorer(lastMapping) : null),
+    [mode, lastMapping],
+  );
   const restoreResult = useMemo(
-    () =>
-      mode === 'restore' ? restoreWithMarks(restoreInput, lastMapping) : { output: '', marks: [] },
-    [mode, restoreInput, lastMapping],
+    () => restoreText?.(restoreInput) ?? { output: '', marks: [] },
+    [restoreText, restoreInput],
   );
   const restoreOutput = restoreResult.output;
 
@@ -205,7 +230,7 @@ export default function WorkbenchApp() {
     return parts;
   }, [restoreResult]);
 
-  const mappingSize = Object.keys(lastMapping).length;
+  const mappingSize = useMemo(() => Object.keys(lastMapping).length, [lastMapping]);
 
   return (
     <div className="flex h-screen flex-col">
@@ -347,26 +372,21 @@ export default function WorkbenchApp() {
               </span>
               <button
                 className="ml-auto rounded border border-[var(--vesper-border)] px-2 py-0.5 hover:border-[var(--vesper-accent)]"
+                disabled={!restoreInput}
                 onClick={() => copyText(restoreOutput)}
               >
                 {t.common.copy}
               </button>
             </div>
             <div className="min-h-0 flex-1 overflow-auto whitespace-pre-wrap break-all p-3 font-mono text-sm">
-              {mappingSize === 0 ? (
-                <p className="text-xs leading-relaxed text-[var(--vesper-text-dim)]">
-                  {t.workbench.restoreNoMappingHint}
+              {restoredHighlighted}
+              {mappingSize === 0 || (restoreInput && restoreResult.marks.length === 0) ? (
+                <p className="mt-3 text-xs text-[var(--vesper-text-dim)]">
+                  {mappingSize === 0
+                    ? t.workbench.restoreNoMappingHint
+                    : t.workbench.restoreNoMatch}
                 </p>
-              ) : restoreResult.marks.length === 0 ? (
-                <>
-                  {restoreOutput}
-                  <p className="mt-3 text-xs text-[var(--vesper-text-dim)]">
-                    {t.workbench.restoreNoMatch}
-                  </p>
-                </>
-              ) : (
-                restoredHighlighted
-              )}
+              ) : null}
             </div>
             <div className="px-3 py-1 text-[10px] text-[var(--vesper-text-dim)]">
               {t.workbench.noMapping}

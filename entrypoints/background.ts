@@ -13,8 +13,7 @@ import {
   findSiteByUrl,
   getActiveScheme,
   getDailyCount,
-  getLastMapping,
-  getMappings,
+  getLatestMapping,
   getSchemes,
   getSettings,
   getSites,
@@ -75,9 +74,7 @@ async function handleRestoreSelection(
 ): Promise<void> {
   const text = info.selectionText ?? '';
   if (!text || tab?.id == null) return;
-  const last =
-    (await getLastMapping()) ??
-    ((await getSettings())?.persistMappings ? (await getMappings())[0] : undefined);
+  const last = await getLatestMapping();
   const restored = restore(text, last?.mapping ?? {});
   const changed = restored !== text;
   await chrome.scripting

@@ -29,7 +29,11 @@ interface Ctx {
 /** 当前生效的拦截上下文；配置变化时实时刷新，不在闭包里固化旧方案 */
 let ctx: Ctx | null = null;
 let refreshId = 0;
-let previewId = 0;
+const REFRESH_RETRY_DELAYS = [250, 1_000, 3_000] as const;
+let refreshRetry: ReturnType<typeof setTimeout> | undefined;
+let refreshOnPaste = false;
+let pasteId = 0;
+let processing: AbortController | undefined;
 let approvedPaste: { target: HTMLElement; text: string; expires: number } | undefined;
 let approvalTimer: ReturnType<typeof setTimeout> | undefined;
 
@@ -39,7 +43,9 @@ function clearApproval(): void {
 }
 let releasePreview: (() => void) | undefined;
 
-function cancelPreview(): void {
+function cancelPaste(): void {
+  pasteId += 1;
+  processing?.abort();
   closePreview();
   releasePreview?.();
   releasePreview = undefined;
@@ -81,16 +87,34 @@ export default defineContentScript({
   },
 });
 
-async function refreshCtx(): Promise<void> {
+async function refreshCtx(attempt = 0): Promise<void> {
+  clearTimeout(refreshRetry);
+  refreshOnPaste = false;
   const id = ++refreshId;
-  const state = await sendMessage({ type: 'GET_SITE_STATE', url: location.href }).catch(() => null);
-  if (id !== refreshId) return;
-  cancelPreview();
-  clearApproval();
-  ctx =
-    state?.status === 'enabled' && state.site && state.scheme
-      ? { site: state.site, scheme: state.scheme }
-      : null;
+  try {
+    const state = await sendMessage({ type: 'GET_SITE_STATE', url: location.href });
+    if (id !== refreshId) return;
+    if (!state || (state.status === 'enabled' && (!state.site || !state.scheme))) {
+      throw new Error('site-state-unavailable');
+    }
+    const next =
+      state.status === 'enabled' && state.site && state.scheme
+        ? { site: state.site, scheme: state.scheme }
+        : null;
+    if (JSON.stringify(ctx) === JSON.stringify(next)) return;
+    ctx = next;
+    const interrupted = processing || releasePreview;
+    cancelPaste();
+    clearApproval();
+    if (interrupted) showToast(t.content.configChanged);
+  } catch {
+    if (id !== refreshId) return;
+    // A failed read is not a decision to disable interception. Retry the read
+    // while keeping the last confirmed policy for this document.
+    const delay = REFRESH_RETRY_DELAYS[attempt];
+    if (delay === undefined) refreshOnPaste = true;
+    else refreshRetry = setTimeout(() => void refreshCtx(attempt + 1), delay);
+  }
 }
 
 type Adapter = ReturnType<typeof pickAdapter>;
@@ -110,13 +134,18 @@ function onDrop(e: DragEvent, adapter: Adapter): void {
 const WORKER_THRESHOLD = 12 * 1024;
 const MIN_PROCESSING_DISPLAY_MS = 300;
 
-function desensitizeInExtension(text: string, scheme: Scheme): Promise<DesensitizeResult> {
+function desensitizeInExtension(
+  text: string,
+  scheme: Scheme,
+  signal: AbortSignal,
+): Promise<DesensitizeResult> {
   return new Promise((resolve, reject) => {
     let port: chrome.runtime.Port | undefined;
     let settled = false;
     const finish = () => {
       settled = true;
       clearTimeout(timer);
+      signal.removeEventListener('abort', abort);
       port?.disconnect();
     };
     const fail = (error: unknown) => {
@@ -124,8 +153,10 @@ function desensitizeInExtension(text: string, scheme: Scheme): Promise<Desensiti
       reject(error);
       finish();
     };
+    const abort = () => fail(new Error('engine-cancelled'));
     // Include extension page startup in the deadline so the modal always unlocks.
     const timer = setTimeout(() => fail(new Error('engine-timeout')), 12_000);
+    signal.addEventListener('abort', abort, { once: true });
     void sendMessage({ type: 'ENSURE_ENGINE' })
       .then((ready) => {
         if (settled) return;
@@ -145,25 +176,32 @@ function desensitizeInExtension(text: string, scheme: Scheme): Promise<Desensiti
 
 async function runPasteEngine(text: string, scheme: Scheme): Promise<DesensitizeResult> {
   const close = showProcessing();
+  const controller = new AbortController();
+  processing = controller;
+  const { signal } = controller;
+  signal.addEventListener('abort', close, { once: true });
   // A warm worker can finish before the browser paints the modal.
   const visibleUntil = performance.now() + MIN_PROCESSING_DISPLAY_MS;
   try {
-    return await desensitizeInExtension(text, scheme);
+    return await desensitizeInExtension(text, scheme, signal);
   } finally {
     const remaining = visibleUntil - performance.now();
-    if (remaining > 0 && document.visibilityState === 'visible') {
+    if (!signal.aborted && remaining > 0 && document.visibilityState === 'visible') {
       await new Promise<void>((resolve) => setTimeout(resolve, remaining));
     }
+    if (processing === controller) processing = undefined;
     close();
   }
 }
 
 function handleIntercept(text: string | undefined, event: Event, adapter: Adapter): void {
-  const current = ctx;
-  if (!text || !current?.scheme.enabled || !current.scheme.rules.some((r) => r.enabled)) return;
+  if (!text) return;
   if (event.defaultPrevented || !event.cancelable || !event.isTrusted) return;
   const source = event.composedPath()[0];
   if (!(source instanceof HTMLElement) || isOwnUI(event.target)) return;
+  const current = ctx;
+  if (refreshOnPaste) void refreshCtx();
+  if (!current?.scheme.enabled || !current.scheme.rules.some((r) => r.enabled)) return;
   const target = adapter.getTarget(source, current.site.selector);
   if (!target) return;
   const approved = approvedPaste;
@@ -193,16 +231,16 @@ function handleIntercept(text: string | undefined, event: Event, adapter: Adapte
   event.preventDefault();
   event.stopImmediatePropagation();
   const insertion = captureInsertion(target, event);
-  const id = ++previewId;
-  cancelPreview();
-  void processPaste(insertion, text, current, id, result);
+  cancelPaste();
+  const id = pasteId;
+  void processPaste(insertion, text, current, () => pasteId === id, result);
 }
 
 async function processPaste(
   insertion: ReturnType<typeof captureInsertion>,
   original: string,
   current: Ctx,
-  id: number,
+  isCurrent: () => boolean,
   result?: DesensitizeResult,
 ): Promise<void> {
   const mode = current.site.mode;
@@ -210,13 +248,14 @@ async function processPaste(
   try {
     const res = result ?? (await runPasteEngine(original, current.scheme));
     if (result) await new Promise<void>((resolve) => setTimeout(resolve, 0));
-    if (ctx !== current || (mode === 'preview' && id !== previewId)) return;
+    if (!isCurrent()) return;
     if (res.hits.length === 0 || mode === 'warn-only') {
-      if ((await insertOrCopy(insertion, original, false)) && res.hits.length > 0) {
+      const outcome = await insertOrCopy(insertion, original, false, isCurrent);
+      if (outcome === 'inserted' && isCurrent() && res.hits.length > 0) {
         showToast(t.content.toastWarn(res.hits.length));
       }
     } else if (mode === 'auto') {
-      await applyDesensitized(insertion, res, current.scheme.id);
+      await applyDesensitized(insertion, res, current.scheme.id, isCurrent);
     } else {
       const release = () => {
         insertion.release();
@@ -224,10 +263,10 @@ async function processPaste(
       };
       showPreview(res, {
         onConfirm: () => {
-          void applyDesensitized(insertion, res, current.scheme.id).finally(release);
+          void applyDesensitized(insertion, res, current.scheme.id, isCurrent).finally(release);
         },
         onPasteOriginal: () => {
-          void insertOrCopy(insertion, original, false).finally(release);
+          void insertOrCopy(insertion, original, false, isCurrent).finally(release);
         },
         onCancel: release,
       });
@@ -235,8 +274,8 @@ async function processPaste(
       awaitingConfirmation = true;
     }
   } catch {
-    if (ctx !== current || (mode === 'preview' && id !== previewId)) return;
-    if (mode === 'warn-only') await insertOrCopy(insertion, original, false);
+    if (!isCurrent()) return;
+    if (mode === 'warn-only') await insertOrCopy(insertion, original, false, isCurrent);
     else showToast(t.content.previewFailed);
   } finally {
     if (!awaitingConfirmation) insertion.release();
@@ -247,19 +286,19 @@ async function insertOrCopy(
   insertion: ReturnType<typeof captureInsertion>,
   text: string,
   redacted: boolean,
-): Promise<boolean> {
-  const current = ctx;
-  const id = previewId;
+  isCurrent: () => boolean,
+): Promise<'inserted' | 'copied' | 'partial' | 'failed'> {
+  if (!isCurrent()) return 'failed';
   let dismissProgress: (() => void) | undefined;
   const progress = setTimeout(() => {
-    if (ctx === current && previewId === id) {
+    if (isCurrent()) {
       dismissProgress = showToast(t.content.inserting, { persistent: true });
     }
   }, 200);
   let offset = 0;
   try {
-    const remaining = await insertion.insert(text, () => ctx === current && previewId === id);
-    if (remaining === null) return true;
+    const remaining = await insertion.insert(text, isCurrent);
+    if (remaining === null) return 'inserted';
     offset = remaining;
   } catch {
     // The destination may have changed while the preview was open.
@@ -268,16 +307,14 @@ async function insertOrCopy(
     dismissProgress?.();
   }
   // A newer paste owns the clipboard. A partial write must never copy the prefix again.
-  if (previewId !== id) return false;
+  if (!isCurrent()) return 'failed';
   const remaining = text.slice(offset);
   try {
     await navigator.clipboard.writeText(remaining);
-    if (previewId !== id) return false;
-    if (ctx === current) {
-      clearApproval();
-      approvedPaste = { target: insertion.target, text: remaining, expires: Date.now() + 60_000 };
-      approvalTimer = setTimeout(clearApproval, 60_000);
-    }
+    if (!isCurrent()) return 'failed';
+    clearApproval();
+    approvedPaste = { target: insertion.target, text: remaining, expires: Date.now() + 60_000 };
+    approvalTimer = setTimeout(clearApproval, 60_000);
     showToast(
       offset > 0
         ? t.content.partialCopied
@@ -285,27 +322,28 @@ async function insertOrCopy(
           ? t.content.fallbackCopied
           : t.content.originalCopied,
     );
+    return 'copied';
   } catch {
-    if (previewId === id)
-      showToast(offset > 0 ? t.content.partialFailed : t.content.fallbackFailed);
+    if (isCurrent()) showToast(offset > 0 ? t.content.partialFailed : t.content.fallbackFailed);
+    return offset > 0 ? 'partial' : 'failed';
   }
-  return false;
 }
 
 async function applyDesensitized(
   insertion: ReturnType<typeof captureInsertion>,
   res: DesensitizeResult,
   schemeId: string,
+  isCurrent: () => boolean,
 ): Promise<void> {
-  if (await insertOrCopy(insertion, res.output, true)) {
+  const outcome = await insertOrCopy(insertion, res.output, true, isCurrent);
+  if (!isCurrent() || outcome === 'failed') return;
+  void sendMessage({ type: 'RECORD_MAPPING', schemeId, mapping: res.mapping }).catch(() => {});
+  if (outcome === 'inserted') {
     const undo = insertion.getUndo();
     showToast(
       t.content.toastDesensitized(res.hits.length),
       undo ? { onUndo: undo.undo, onDismiss: undo.dispose } : {},
     );
     void sendMessage({ type: 'INCREMENT_COUNT' }).catch(() => {});
-  }
-  if (Object.keys(res.mapping).length > 0) {
-    void sendMessage({ type: 'RECORD_MAPPING', schemeId, mapping: res.mapping }).catch(() => {});
   }
 }

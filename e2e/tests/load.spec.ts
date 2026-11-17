@@ -88,3 +88,25 @@ test('还原模式：脱敏产物的占位符可还原回原文', async ({ extCt
   // 3) 还原输出区应包含原文邮箱（同值一致 → 同一占位符还原为同一原值）
   await expect(result).toContainText('zhangsan@acme.com', { timeout: 3000 });
 });
+
+test('已打开的工作台跟随后续脱敏更新还原映射', async ({ extCtx, extensionId }) => {
+  const page = await extCtx.newPage();
+  await page.goto(`chrome-extension://${extensionId}/workbench.html`);
+  const record = (mapping: Record<string, string>) =>
+    page.evaluate(
+      (mapping) =>
+        chrome.runtime.sendMessage({ type: 'RECORD_MAPPING', schemeId: 'test', mapping }),
+      mapping,
+    );
+  await page.getByRole('button', { name: '还原模式' }).click();
+  await page.locator('textarea').fill('回复 [EMAIL_1]');
+  const result = page.locator('div.whitespace-pre-wrap');
+
+  await record({ '[EMAIL_1]': 'first@example.com' });
+  await expect(result).toContainText('回复 first@example.com');
+  await record({ '[EMAIL_1]': 'second@example.com' });
+  await expect(result).toContainText('回复 second@example.com');
+  await record({});
+  await expect(page.getByText('暂无可还原的映射')).toBeVisible();
+  await expect(result).toContainText('回复 [EMAIL_1]');
+});

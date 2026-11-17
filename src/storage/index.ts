@@ -1,5 +1,5 @@
 /**
- * 存储层（VESPEER.md D4 / T4）：仅使用 chrome.storage.local。
+ * 存储层（VESPEER.md D4 / T4）：使用 chrome.storage.local 和 chrome.storage.session。
  *
  * 红线：
  * - 禁止 chrome.storage.sync（规则库含真实敏感词，同步即外泄）。
@@ -46,11 +46,13 @@ export interface MappingRecord {
   mapping: Record<string, string>;
 }
 
+export const LAST_MAPPING_KEY = 'vesper:lastMapping';
+export const MAPPING_HISTORY_KEY = 'vesper:mappings';
+
 const KEYS = {
   schemes: 'vesper:schemes',
   sites: 'vesper:sites',
   settings: 'vesper:settings',
-  mappings: 'vesper:mappings',
   meta: 'vesper:meta',
   count: 'vesper:dailyCount',
 } as const;
@@ -364,22 +366,23 @@ export async function getDailyCount(): Promise<number> {
 // ---------- 映射（文档 4.7：默认不持久化） ----------
 
 export async function getMappings(): Promise<MappingRecord[]> {
-  return (await get<MappingRecord[]>(KEYS.mappings)) ?? [];
+  return (await get<MappingRecord[]>(MAPPING_HISTORY_KEY)) ?? [];
 }
 
 export async function pushMapping(rec: MappingRecord): Promise<void> {
-  return navigator.locks.request('vesper:mappings', async () => {
-    await chrome.storage.session.set({ 'vesper:lastMapping': rec });
+  return navigator.locks.request(MAPPING_HISTORY_KEY, async () => {
+    await chrome.storage.session.set({ [LAST_MAPPING_KEY]: rec });
     if (!(await getSettings())?.persistMappings) return;
     const list = await getMappings();
-    await set(KEYS.mappings, [rec, ...list.slice(0, 19)]);
+    await set(MAPPING_HISTORY_KEY, [rec, ...list.slice(0, 19)]);
   });
 }
 
-/** 读取最近一次脱敏映射（session，供右键还原；persistMappings 关闭时也可用） */
-export async function getLastMapping(): Promise<MappingRecord | undefined> {
-  const obj = await chrome.storage.session.get('vesper:lastMapping');
-  return obj['vesper:lastMapping'] as MappingRecord | undefined;
+/** 优先读浏览器会话内的最新一批；开启本地保留时才读取跨会话记录。 */
+export async function getLatestMapping(): Promise<MappingRecord | undefined> {
+  const obj = await chrome.storage.session.get(LAST_MAPPING_KEY);
+  const last = obj[LAST_MAPPING_KEY] as MappingRecord | undefined;
+  return last ?? ((await getSettings())?.persistMappings ? (await getMappings())[0] : undefined);
 }
 
 // ---------- 导入 / 导出 / 清除 ----------
@@ -532,8 +535,8 @@ export async function importAll(bundle: ExportBundle): Promise<void> {
 export async function clearAll(): Promise<void> {
   await navigator.locks.request('vesper:settings', () =>
     navigator.locks.request('vesper:count', () =>
-      navigator.locks.request('vesper:mappings', async () => {
-        await chrome.storage.session.remove(['vesper:lastMapping', 'vesper:pendingInput']);
+      navigator.locks.request(MAPPING_HISTORY_KEY, async () => {
+        await chrome.storage.session.remove([LAST_MAPPING_KEY, 'vesper:pendingInput']);
         await chrome.storage.local.clear();
         await ensureSeeded();
       }),

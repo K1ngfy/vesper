@@ -3,7 +3,7 @@
  */
 import { describe, expect, it } from 'vitest';
 import { desensitize, maskValue, testRule } from '../src/core/engine';
-import { restore } from '../src/core/restore';
+import { createRestorer, restore } from '../src/core/restore';
 import { DETECTORS } from '../src/core/detectors';
 import type { BuiltinDetectorId, Rule, Scheme } from '../src/core/types';
 
@@ -71,6 +71,32 @@ describe('文档第 9 节 fixture', () => {
   it('restore 往返一致', () => {
     const res = desensitize(FIXTURE_INPUT, fixtureScheme());
     expect(restore(res.output, res.mapping)).toBe(FIXTURE_INPUT);
+  });
+});
+
+describe('还原占位符', () => {
+  it('使用最长的字面匹配并保留还原后的位置，不递归替换原值', () => {
+    const restoreText = createRestorer({
+      '[A].💬': '原值',
+      '[A]': '[B]',
+      '[B]': '另一个值',
+      '': '忽略空占位符',
+    });
+    expect(restoreText('前[A].💬/[A][B]')).toEqual({
+      output: '前原值/[B]另一个值',
+      marks: [
+        { index: 1, length: 2, placeholder: '[A].💬', original: '原值' },
+        { index: 4, length: 3, placeholder: '[A]', original: '[B]' },
+        { index: 7, length: 4, placeholder: '[B]', original: '另一个值' },
+      ],
+    });
+  });
+
+  it('大量编号占位符仍能准确还原首尾映射', () => {
+    const mapping = Object.fromEntries(
+      Array.from({ length: 50_000 }, (_, i) => [`[EMAIL_${i + 1}]`, `示例${i + 1}`]),
+    );
+    expect(restore('回复 [EMAIL_1] 和 [EMAIL_50000]', mapping)).toBe('回复 示例1 和 示例50000');
   });
 });
 

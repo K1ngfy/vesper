@@ -63,16 +63,21 @@ async function setup(
       const w = window as unknown as {
         chrome: unknown;
         __vesperState: unknown;
+        __vesperStateReads: number;
         __vesperListeners: ((changes: unknown, area: string) => void)[];
         __finishRedaction?: (succeeded: boolean) => void;
       };
       w.__vesperState = state;
+      w.__vesperStateReads = 0;
       w.__vesperListeners = [];
       w.chrome = {
         runtime: {
           id: 'vesper-test',
           sendMessage: (msg: { type?: string }) => {
-            if (msg?.type === 'GET_SITE_STATE') return Promise.resolve(w.__vesperState);
+            if (msg?.type === 'GET_SITE_STATE') {
+              w.__vesperStateReads += 1;
+              return Promise.resolve(w.__vesperState);
+            }
             if (msg?.type === 'INCREMENT_COUNT') return Promise.resolve(1);
             if (msg?.type === 'RECORD_MAPPING') return Promise.resolve(undefined);
             if (msg?.type === 'ENSURE_ENGINE') {
@@ -130,6 +135,27 @@ async function pasteInto(page: import('@playwright/test').Page, selector: string
   await page.locator(selector).focus();
   await page.evaluate((value) => navigator.clipboard.writeText(value), text);
   await page.keyboard.press('ControlOrMeta+V');
+}
+
+async function setSiteState(page: import('@playwright/test').Page, state: unknown, notify = true) {
+  await page.evaluate(
+    ({ state, notify }) => {
+      const w = window as unknown as {
+        __vesperState: unknown;
+        __vesperListeners: ((changes: unknown, area: string) => void)[];
+      };
+      w.__vesperState = state;
+      if (notify) for (const fn of w.__vesperListeners) fn({ 'vesper:settings': {} }, 'local');
+    },
+    { state, notify },
+  );
+}
+
+async function waitForSiteReads(page: import('@playwright/test').Page, count: number) {
+  await page.waitForFunction(
+    (count) => (window as unknown as { __vesperStateReads: number }).__vesperStateReads >= count,
+    count,
+  );
 }
 
 test.describe('粘贴拦截全链路（真实构建产物 + chrome API 桩）', () => {
@@ -209,23 +235,46 @@ test.describe('粘贴拦截全链路（真实构建产物 + chrome API 桩）', 
     await expect(page.locator('#ta')).toHaveValue('公司A');
 
     // 模拟用户在 Popup 切换到 Work 方案（同一关键字，替换为"公司B"）
-    await page.evaluate((baseState) => {
-      const w = window as unknown as {
-        __vesperState: typeof baseState;
-        __vesperListeners: ((changes: unknown, area: string) => void)[];
-      };
-      const next = JSON.parse(JSON.stringify(baseState)) as typeof baseState;
-      next.scheme.id = 'sch_work';
-      next.scheme.name = 'Work';
-      next.scheme.rules[0]!.replacement = '公司B';
-      w.__vesperState = next;
-      for (const fn of w.__vesperListeners) fn({ 'vesper:settings': {} }, 'local');
-    }, makeSiteState('auto'));
-    await page.waitForTimeout(300); // 等 refreshCtx 完成
+    const next = makeSiteState('auto');
+    next.scheme.id = 'sch_work';
+    next.scheme.name = 'Work';
+    next.scheme.rules[0]!.replacement = '公司B';
+    await setSiteState(page, next);
+    await waitForSiteReads(page, 2);
 
     await page.locator('#ta').fill('');
     await pasteInto(page, '#ta', '星辰科技');
     await expect(page.locator('#ta')).toHaveValue('公司B');
+  });
+
+  test('站点状态暂时读取失败后，连续粘贴仍脱敏并自动恢复配置同步', async ({ page }) => {
+    await setup(page, 'auto');
+    await page.clock.install();
+    const field = page.locator('#ta');
+    for (const original of ['星辰科技 ', '星辰科技 ']) await pasteInto(page, '#ta', original);
+    await expect(field).toHaveValue('公司A 公司A ');
+
+    await setSiteState(page, null);
+    await waitForSiteReads(page, 2);
+    await pasteInto(page, '#ta', '星辰科技 ');
+    await expect(field).toHaveValue('公司A 公司A 公司A ');
+
+    await setSiteState(page, { status: 'disabled' }, false);
+    await page.clock.fastForward(1_000);
+    await waitForSiteReads(page, 3);
+    await pasteInto(page, '#ta', '星辰科技');
+    await expect(field).toHaveValue('公司A 公司A 公司A 星辰科技');
+  });
+
+  test('重读相同站点配置时既有预览仍可确认', async ({ page }) => {
+    await setup(page, 'preview');
+    await pasteInto(page, '#ta', '星辰科技');
+    const dialog = page.getByRole('dialog', { name: '粘贴预览' });
+    await expect(dialog).toBeVisible();
+    await setSiteState(page, makeSiteState('preview'));
+    await waitForSiteReads(page, 2);
+    await dialog.getByRole('button', { name: '脱敏粘贴' }).click();
+    await expect(page.locator('#ta')).toHaveValue('公司A');
   });
 });
 
@@ -412,6 +461,27 @@ test.describe('大文本脱敏动画', () => {
     await expect(field).toHaveValue('');
     await field.fill('可以继续输入');
     await expect(field).toHaveValue('可以继续输入');
+    await field.clear();
+    await pasteInto(page, '#ta', large);
+    await expect(busy(page)).toBeVisible();
+    await finishRedaction(page, true);
+    await expect(field).toHaveValue(large.replace('星辰科技', '公司A'));
+  });
+
+  test('实际切换方案时中止旧处理，迟到结果不会影响下一次粘贴', async ({ page }) => {
+    await setup(page, 'auto', 'deferred');
+    await pasteInto(page, '#ta', large);
+    await expect(busy(page)).toBeVisible();
+
+    const next = makeSiteState('auto');
+    next.scheme.rules[0]!.replacement = '公司B';
+    await setSiteState(page, next);
+    await expect(page.getByText(/本次粘贴已取消/)).toBeVisible();
+    await expect(busy(page)).toHaveCount(0);
+    await finishRedaction(page, true);
+
+    await pasteInto(page, '#ta', '星辰科技');
+    await expect(page.locator('#ta')).toHaveValue('公司B');
   });
 
   test('Worker 启动超时后自动解锁，迟到的响应不会回填', async ({ page }) => {
