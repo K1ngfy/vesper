@@ -320,3 +320,42 @@ test('全局模式：例外站点修改时保存按钮变黑，点击保存落�
   });
   expect(afterSave).toContain('internal.corp.example');
 });
+
+test('全局模式未授权时使用红色文字展示相关授权提示信息', async ({ extCtx, extensionId }) => {
+  const page = await openOptions(extCtx, extensionId);
+  await page.getByText('站点拦截').click();
+
+  const readTextRgb = (locator: import('@playwright/test').Locator) =>
+    locator.evaluate((el) => {
+      const canvas = document.createElement('canvas');
+      canvas.width = 1;
+      canvas.height = 1;
+      const ctx = canvas.getContext('2d')!;
+      ctx.fillStyle = getComputedStyle(el).color;
+      ctx.fillRect(0, 0, 1, 1);
+      const [r, g, b] = ctx.getImageData(0, 0, 1, 1).data;
+      return [r, g, b];
+    });
+
+  // 1) 默认未授予 *://*/* 时，「全局模式」卡片内显示红色未授权提示
+  const needGrant = page.getByTestId('global-need-grant');
+  await expect(needGrant).toBeVisible();
+  await expect(needGrant).toContainText('尚未授权「访问所有网站」，点击本卡片完成授权');
+  const cardRgb = await readTextRgb(needGrant);
+  expect(cardRgb[0]).toBeGreaterThan(180);
+  expect(cardRgb[1]).toBeLessThan(70);
+  expect(cardRgb[2]).toBeLessThan(70);
+
+  // 2) 点击「全局模式」但拒绝权限时，页面顶部也用红色文字提示未完成授权
+  await page.evaluate(() => {
+    chrome.permissions.request = () => Promise.resolve(false);
+  });
+  await page.getByRole('button', { name: /全局模式/ }).click();
+  const notice = page.getByTestId('sites-notice');
+  await expect(notice).toBeVisible();
+  await expect(notice).toContainText('尚未授予「访问所有网站」权限');
+  const noticeRgb = await readTextRgb(notice);
+  expect(noticeRgb[0]).toBeGreaterThan(180);
+  expect(noticeRgb[1]).toBeLessThan(70);
+  expect(noticeRgb[2]).toBeLessThan(70);
+});

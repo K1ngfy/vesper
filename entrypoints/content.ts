@@ -133,7 +133,7 @@ async function refreshCtx(attempt = 0): Promise<void> {
     const interrupted = processing || releasePreview;
     cancelPaste();
     clearApproval();
-    if (interrupted) showToast(t.content.configChanged);
+    if (interrupted) showToast(t.content.configChanged, { variant: 'warning' });
   } catch {
     if (id !== refreshId) return;
     // A failed read is not a decision to disable interception. Retry the read
@@ -262,7 +262,7 @@ function handleIntercept(text: string | undefined, event: Event, adapter: Adapte
     if (current.site.mode === 'warn-only') return;
     event.preventDefault();
     event.stopImmediatePropagation();
-    showToast(t.content.pasteTooLarge);
+    showToast(t.content.pasteTooLarge, { variant: 'error' });
     return;
   }
 
@@ -285,7 +285,7 @@ function handleIntercept(text: string | undefined, event: Event, adapter: Adapte
     warnController = undefined;
     if (result) {
       const count = totalHits(result);
-      if (count > 0) showToast(t.content.toastWarn(count));
+      if (count > 0) showToast(t.content.toastWarn(count), { variant: 'warning' });
       return;
     }
     const controller = new AbortController();
@@ -295,7 +295,7 @@ function handleIntercept(text: string | undefined, event: Event, adapter: Adapte
         if (warnController !== controller) return;
         warnController = undefined;
         const count = totalHits(res);
-        if (count > 0) showToast(t.content.toastWarn(count));
+        if (count > 0) showToast(t.content.toastWarn(count), { variant: 'warning' });
       })
       .catch(() => {
         if (warnController === controller) warnController = undefined;
@@ -328,7 +328,7 @@ async function processPaste(
     if (hitCount === 0 || mode === 'warn-only') {
       const outcome = await insertOrCopy(insertion, original, false, isCurrent);
       if (outcome === 'inserted' && isCurrent() && hitCount > 0) {
-        showToast(t.content.toastWarn(hitCount));
+        showToast(t.content.toastWarn(hitCount), { variant: 'warning' });
       }
     } else if (mode === 'auto') {
       await applyDesensitized(insertion, res, current.scheme.id, isCurrent);
@@ -357,6 +357,7 @@ async function processPaste(
       const msg = error instanceof Error ? error.message : String(error);
       showToast(
         /context invalidated/i.test(msg) ? t.content.contextInvalidated : t.content.previewFailed,
+        { variant: 'error' },
       );
     }
   } finally {
@@ -374,7 +375,7 @@ async function insertOrCopy(
   let dismissProgress: (() => void) | undefined;
   const progress = setTimeout(() => {
     if (isCurrent()) {
-      dismissProgress = showToast(t.content.inserting, { persistent: true });
+      dismissProgress = showToast(t.content.inserting, { persistent: true, variant: 'info' });
     }
   }, 200);
   let offset = 0;
@@ -409,10 +410,15 @@ async function insertOrCopy(
           : redacted
             ? t.content.fallbackCopied
             : t.content.originalCopied,
+      { variant: offset > 0 ? 'warning' : 'info' },
     );
     return 'copied';
   } catch {
-    if (isCurrent()) showToast(offset > 0 ? t.content.partialFailed : t.content.fallbackFailed);
+    if (isCurrent()) {
+      showToast(offset > 0 ? t.content.partialFailed : t.content.fallbackFailed, {
+        variant: 'error',
+      });
+    }
     return offset > 0 ? 'partial' : 'failed';
   }
 }
@@ -430,7 +436,9 @@ async function applyDesensitized(
     const undo = insertion.getUndo();
     showToast(
       t.content.toastDesensitized(totalHits(res)),
-      undo ? { onUndo: undo.undo, onDismiss: undo.dispose } : {},
+      undo
+        ? { variant: 'success', onUndo: undo.undo, onDismiss: undo.dispose }
+        : { variant: 'success' },
     );
     void sendMessage({ type: 'INCREMENT_COUNT' }).catch(() => {});
   } else if (outcome === 'copied') {

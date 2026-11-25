@@ -114,9 +114,11 @@ export default function SitesTab() {
   const siteSaveTimer = useRef<number | null>(null);
   const sitesRef = useRef<SiteRule[]>([]);
   const [globalGranted, setGlobalGranted] = useState(false);
+  const [permissionsChecked, setPermissionsChecked] = useState(false);
   const [grantedSites, setGrantedSites] = useState<Set<string>>(new Set());
   const [globalMode, setGlobalMode] = useState<SiteMode>('preview');
   const [notice, setNotice] = useState('');
+  const [noticeTone, setNoticeTone] = useState<'info' | 'error'>('info');
   const [expanded, setExpanded] = useState<Record<string, boolean>>({});
   const [filter, setFilter] = useState<Filter>('all');
   const [selected, setSelected] = useState<Set<string>>(new Set());
@@ -192,6 +194,7 @@ export default function SitesTab() {
       if (stopped) return;
       setGlobalGranted(global);
       setGrantedSites(new Set(granted.filter((id) => id !== null)));
+      setPermissionsChecked(true);
     }
     void refreshPermissions();
     chrome.permissions.onAdded.addListener(refreshPermissions);
@@ -241,14 +244,19 @@ export default function SitesTab() {
     await sendMessage({ type: 'REFRESH_SITE_REGISTRATIONS' });
   }
 
+  function showNoticeMessage(text: string, tone: 'info' | 'error' = 'info') {
+    setNotice(text);
+    setNoticeTone(tone);
+  }
+
   async function enableGlobal() {
     const granted = await chrome.permissions.request({ origins: ['*://*/*'] }).catch(() => false);
     if (!granted) {
-      setNotice(t.options.permissionDenied);
+      showNoticeMessage(t.options.globalPermissionDenied, 'error');
       return;
     }
     setGlobalGranted(true);
-    setNotice(t.options.refreshHint);
+    showNoticeMessage(t.options.refreshHint, 'info');
     await persistScope('global');
   }
 
@@ -282,10 +290,10 @@ export default function SitesTab() {
       const origins = hostToOrigins(site.host);
       const granted = await chrome.permissions.request({ origins }).catch(() => false);
       if (!granted) {
-        setNotice(t.options.permissionDenied);
+        showNoticeMessage(t.options.permissionDenied, 'error');
         return;
       }
-      setNotice(t.options.refreshHint);
+      showNoticeMessage(t.options.refreshHint, 'info');
     } else {
       const removable = getRemovableOrigins(
         [site],
@@ -295,7 +303,7 @@ export default function SitesTab() {
       if (removable.length > 0) {
         await chrome.permissions.remove({ origins: removable }).catch(() => {});
       }
-      setNotice('');
+      showNoticeMessage('');
     }
     await persistSites(next, true);
   }
@@ -327,7 +335,7 @@ export default function SitesTab() {
   function openAdd() {
     setDraft({ name: '', host: '', category: 'custom', schemeId: '', mode: 'preview' });
     setAddError('');
-    setNotice('');
+    showNoticeMessage('');
     setShowAdd(true);
   }
 
@@ -357,15 +365,15 @@ export default function SitesTab() {
     void persistSites([...sitesRef.current, site], true);
     setAddError('');
     setShowAdd(false);
-    setNotice(t.options.addSiteSuccess);
+    showNoticeMessage(t.options.addSiteSuccess, 'info');
   }
 
   function copyAiPrompt(host: string) {
     const prompt = t.options.selectorAiPrompt.replace('{host}', host || '（目标站点域名）');
     void navigator.clipboard
       .writeText(prompt)
-      .then(() => setNotice(t.options.aiPromptCopied))
-      .catch(() => setNotice('复制失败'));
+      .then(() => showNoticeMessage(t.options.aiPromptCopied, 'info'))
+      .catch(() => showNoticeMessage('复制失败', 'error'));
   }
 
   // ---------- 批量选择与操作 ----------
@@ -393,14 +401,14 @@ export default function SitesTab() {
     const origins = Array.from(new Set(targets.flatMap((s) => hostToOrigins(s.host))));
     const granted = await chrome.permissions.request({ origins }).catch(() => false);
     if (!granted) {
-      setNotice(t.options.permissionDenied);
+      showNoticeMessage(t.options.permissionDenied, 'error');
       return;
     }
     await persistSites(
       sitesRef.current.map((s) => (selected.has(s.id) ? { ...s, enabled: true } : s)),
       true,
     );
-    setNotice(t.options.refreshHint);
+    showNoticeMessage(t.options.refreshHint, 'info');
     clearSelection();
   }
 
@@ -582,8 +590,11 @@ export default function SitesTab() {
             <div className="mt-1 text-xs text-[var(--vesper-text-dim)]">
               {t.options.scopeGlobalDesc}
             </div>
-            {scope === 'global' && !globalGranted && (
-              <span className="mt-1 block text-[11px] text-neutral-600">
+            {permissionsChecked && !globalGranted && (
+              <span
+                data-testid="global-need-grant"
+                className="mt-1.5 block text-xs font-medium text-red-600"
+              >
                 {t.options.scopeGlobalNeedGrant}
               </span>
             )}
@@ -620,11 +631,35 @@ export default function SitesTab() {
         </div>
       </section>
 
-      {notice && <div className="text-sm text-neutral-600">{notice}</div>}
+      {notice && (
+        <div
+          data-testid="sites-notice"
+          className={`text-sm ${
+            noticeTone === 'error' ? 'font-medium text-red-600' : 'text-neutral-600'
+          }`}
+        >
+          {notice}
+        </div>
+      )}
 
       {scope === 'global' ? (
         /* 全局模式：拦截模式 + 例外主机（多行文本框，每行一条） */
         <section className="space-y-4">
+          {permissionsChecked && !globalGranted && (
+            <div
+              data-testid="global-ungranted-alert"
+              className="flex flex-wrap items-center justify-between gap-2 rounded-md border border-red-200 bg-red-50/80 px-3 py-2 text-xs text-red-600"
+            >
+              <span className="font-medium">{t.options.scopeGlobalUngrantedAlert}</span>
+              <button
+                type="button"
+                onClick={() => void enableGlobal()}
+                className="rounded bg-red-600 px-2.5 py-1 font-medium text-white hover:bg-red-700"
+              >
+                {t.options.grantNow}
+              </button>
+            </div>
+          )}
           {/* 拦截模式 */}
           <div>
             <h4 className="mb-1 text-sm font-medium">{t.options.globalModeTitle}</h4>

@@ -30,7 +30,7 @@ const STATUS_CLS: Record<string, string> = {
   enabled: 'text-black',
   disabled: 'text-neutral-500',
   unconfigured: 'text-neutral-400',
-  'no-permission': 'text-neutral-600',
+  'no-permission': 'font-medium text-red-600',
 };
 
 export default function App() {
@@ -270,7 +270,9 @@ export default function App() {
       : statusKey === 'disabled'
         ? t.popup.siteDisabled
         : statusKey === 'no-permission'
-          ? t.popup.siteNoPermission
+          ? scope === 'global'
+            ? t.popup.globalNoPermission
+            : t.popup.siteNoPermission
           : t.popup.siteUnconfigured;
 
   // 渐进授权按钮：总开关开启时，list 模式下未配置/无权限/站点未启用可一键启用当前站点；

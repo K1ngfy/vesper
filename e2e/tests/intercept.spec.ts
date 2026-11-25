@@ -284,6 +284,38 @@ test.describe('粘贴拦截全链路（真实构建产物 + chrome API 桩）', 
     await expect(page.getByText(/发现 2 处敏感信息，已按"仅提醒"放行原文/)).toBeVisible();
   });
 
+  test('Toast 通知位于右上角，持续显示 10 秒，且支持手动关闭', async ({ page }) => {
+    await page.setViewportSize({ width: 1000, height: 700 });
+    await setup(page, 'auto');
+    await page.clock.install();
+
+    await pasteInto(page, '#ta', '星辰科技的项目 zhangsan@acme.com 结束');
+    const toast = page.locator('#vesper-shadow-host .toast');
+    await expect(toast).toBeVisible();
+    await expect(toast).toHaveAttribute('data-variant', 'success');
+    await expect(toast.locator('.toast-bar')).toHaveCount(1);
+
+    // 验证位于视口右上角（而非右下角；计入入场微位移滑入动画余量）
+    const box = (await toast.boundingBox())!;
+    expect(box.y).toBeGreaterThanOrEqual(8);
+    expect(box.y).toBeLessThan(60);
+    expect(1000 - (box.x + box.width)).toBeGreaterThanOrEqual(4);
+    expect(1000 - (box.x + box.width)).toBeLessThan(50);
+
+    // 7.5 秒时仍保持显示（延长了原 6 秒显示时长），超过 10 秒后自动消失
+    await page.clock.fastForward(7_500);
+    await expect(toast).toBeVisible();
+    await page.clock.fastForward(3_000);
+    await expect(toast).toHaveCount(0);
+
+    // 再次触发粘贴，验证点击右上角关闭按钮可立即收起通知
+    await page.locator('#ta').fill('');
+    await pasteInto(page, '#ta', '星辰科技');
+    await expect(toast).toBeVisible();
+    await toast.locator('[data-act="dismiss"]').click();
+    await expect(toast).toHaveCount(0);
+  });
+
   test('beforeinput 自接管富文本编辑器：回填不误判失败且不污染剪贴板', async ({ page }) => {
     await setup(page, 'auto');
     const editor = page.locator('#ce');

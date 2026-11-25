@@ -35,6 +35,7 @@ export const zhCN = {
     siteDisabled: '拦截已停用',
     siteUnconfigured: '未配置',
     siteNoPermission: '无站点权限',
+    globalNoPermission: '全局模式未授权',
     openWorkbench: '工作台',
     openOptions: '配置',
     openSidePanel: '侧边栏',
@@ -154,6 +155,8 @@ export const zhCN = {
     scopeGlobal: '全局模式',
     scopeGlobalDesc: '拦截所有网站，需授权「访问所有网站」权限；可在下方设置例外主机',
     scopeGlobalNeedGrant: '尚未授权「访问所有网站」，点击本卡片完成授权',
+    scopeGlobalUngrantedAlert: '当前尚未授予「访问所有网站」权限，全局模式暂未生效',
+    grantNow: '立即授权',
     scopeActive: '当前正在启用',
     excludeListTitle: '例外站点（不拦截）',
     excludeListHint: '每行一个主机或网段，命中的站点不做拦截处理',
@@ -171,6 +174,8 @@ export const zhCN = {
     selectorAiPrompt:
       '我在使用一个浏览器扩展，需要在某网站的输入框上拦截粘贴并做文本脱敏。该扩展用 `el.closest(selector)` 判定可拦截的输入目标：命中选择器的元素（或其祖先）若为可编辑元素即视为拦截目标。请根据我提供的页面 HTML，给出一个能精确匹配该网站主输入框（textarea / contenteditable）的 CSS 选择器，并说明它匹配什么。仅返回选择器与简短说明，不要其他内容。\n\n网站域名：{host}\n\n页面 HTML 片段（请把目标输入框的 outerHTML 粘贴在此）：',
     permissionDenied: '权限申请被拒，站点已保存为未启用',
+    globalPermissionDenied:
+      '尚未授予「访问所有网站」权限，全局模式未生效，请点击「全局模式」卡片重新授权',
     exportWarn: '导出文件包含你的敏感词规则，请妥善保管。',
     clearAll: '清除全部本地数据',
     clearAllConfirm: '将删除所有方案、站点配置与本地计数，且不可恢复。确认继续？',
@@ -224,6 +229,12 @@ export const zhCN = {
   content: {
     toastDesensitized: (n: number) => `VESPER 已脱敏 ${n} 处`,
     toastWarn: (n: number) => `VESPER 发现 ${n} 处敏感信息，已按"仅提醒"放行原文`,
+    toastKickerSuccess: '隐私脱敏防护',
+    toastKickerWarn: '敏感信息提醒',
+    toastKickerError: '粘贴异常提示',
+    toastKickerInfo: '剪贴板状态',
+    toastKickerLoading: '正在处理',
+    toastClose: '关闭通知',
     undo: '撤销',
     view: '查看',
     previewTitle: '粘贴预览',
