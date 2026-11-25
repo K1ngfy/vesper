@@ -22,7 +22,13 @@ const CASES: Record<string, { positive: string[]; negative: string[] }> = {
     negative: ['not-an-email', 'a@b（缺少顶级域）'],
   },
   phone_cn: {
-    positive: ['13812345678', '138-1234-5678', '139 1234 5678'],
+    positive: [
+      '13812345678',
+      '138-1234-5678',
+      '139 1234 5678',
+      '+8613812345678',
+      '+86 13812345678',
+    ],
     negative: ['12345678901（第二位非 3-9）', '138123456789（12 位过长）'],
   },
   ipv4: {
@@ -66,16 +72,30 @@ const CASES: Record<string, { positive: string[]; negative: string[] }> = {
     negative: ['110101199003077（17 位）', '1234567890123456789（19 位过长）'],
   },
   db_conn: {
-    positive: ['password=secret123', 'postgres://user:passw0rd@10.0.0.1/db'],
-    negative: ['username=foo（非密码键）', '普通文本没有连接串'],
+    positive: [
+      'password=secret123',
+      'password="p@ss;word,123"',
+      '{"password": "json_secret"}',
+      'postgres://user:passw0rd@10.0.0.1/db',
+    ],
+    negative: [
+      'username=foo（非密码键）',
+      '普通文本没有连接串',
+      'https://example.com:8080/users/alice@acme.com',
+      'password=""',
+    ],
   },
   bearer: {
-    positive: ['Authorization: Bearer abc.def.ghi', 'authorization: bearer token123'],
+    positive: [
+      'Authorization: Bearer abc.def.ghi',
+      'authorization: bearer token123',
+      '{"Authorization": "Bearer json_tok_123"}',
+    ],
     negative: ['Authorization: Basic xyz（非 Bearer）', 'Bearer 后面没有内容\n'],
   },
   generic_secret: {
-    positive: ['api_key=abc123', 'secret: xyz789'],
-    negative: ['monkey=abc（key 非独立词）', '今天天气不错'],
+    positive: ['api_key=abc123', 'secret: xyz789', '{"api_key": "val,with;chars"}'],
+    negative: ['monkey=abc（key 非独立词）', '今天天气不错', '{"api_key": ""}'],
   },
 };
 

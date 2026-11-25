@@ -276,6 +276,31 @@ test.describe('粘贴拦截全链路（真实构建产物 + chrome API 桩）', 
     await dialog.getByRole('button', { name: '脱敏粘贴' }).click();
     await expect(page.locator('#ta')).toHaveValue('公司A');
   });
+
+  test('warn-only 模式：不阻断原生粘贴，保留原文并弹出提醒 Toast', async ({ page }) => {
+    await setup(page, 'warn-only');
+    await pasteInto(page, '#ta', '星辰科技 zhangsan@acme.com');
+    await expect(page.locator('#ta')).toHaveValue('星辰科技 zhangsan@acme.com');
+    await expect(page.getByText(/发现 2 处敏感信息，已按"仅提醒"放行原文/)).toBeVisible();
+  });
+
+  test('beforeinput 自接管富文本编辑器：回填不误判失败且不污染剪贴板', async ({ page }) => {
+    await setup(page, 'auto');
+    const editor = page.locator('#ce');
+    await editor.evaluate((el) => {
+      el.addEventListener('beforeinput', (e) => {
+        const ie = e as InputEvent;
+        if (ie.inputType === 'insertText' && ie.data) {
+          ie.preventDefault();
+          el.textContent = (el.textContent ?? '') + ie.data;
+        }
+      });
+    });
+    await pasteInto(page, '#ce', '联系星辰科技\n第二行');
+    await expect(editor).toHaveText('联系公司A\n第二行');
+    await expect(page.getByText(/VESPER 已脱敏 1 处/)).toBeVisible();
+    expect(await page.evaluate(() => navigator.clipboard.readText())).toBe('联系星辰科技\n第二行');
+  });
 });
 
 test.describe('富文本分批回填', () => {
@@ -383,6 +408,107 @@ test.describe('富文本分批回填', () => {
     await pasteInto(page, '#ce', '星辰科技\n\n  <标签>\t内容  \n');
     await expect(page.getByText(/VESPER 已脱敏 1 处/)).toBeVisible();
     expect(await editor.textContent()).toBe('公司A\n\n  <标签>\t内容  \n');
+  });
+
+  test('ProseMirror 粘贴超长多行文本走单次整段插入，不逐行慢粘贴', async ({ page }) => {
+    await setup(page, 'auto', true);
+    const longText = '星辰科技\n' + '  第 N 行日志\t包含空格  \n\n'.repeat(600) + '结尾行';
+    const expected = longText.replace('星辰科技', '公司A');
+    const editor = page.locator('#ce');
+    await editor.evaluate((el) => {
+      el.classList.add('ProseMirror');
+      let pasteCount = 0;
+      el.addEventListener('paste', (event) => {
+        event.preventDefault();
+        pasteCount += 1;
+        el.setAttribute('data-paste-count', String(pasteCount));
+        const html = (event as ClipboardEvent).clipboardData?.getData('text/html') ?? '';
+        const doc = new DOMParser().parseFromString(html, 'text/html');
+        const paragraphs = [...doc.querySelectorAll('[data-pm-slice] > p')];
+        el.textContent = (el.textContent ?? '') + paragraphs.map((p) => p.textContent).join('\n');
+      });
+    });
+    await pasteInto(page, '#ce', longText);
+    await expect(page.getByText(/VESPER 已脱敏 1 处/)).toBeVisible({ timeout: 5000 });
+    await expect(editor).toHaveAttribute('data-paste-count', '1');
+    expect(await editor.textContent()).toBe(expected);
+  });
+
+  test('通用现代富文本编辑器（Lexical/Slate 风格）长文本走单次纯文本 paste 回填', async ({
+    page,
+  }) => {
+    await setup(page, 'auto', true);
+    const longText = '星辰科技\n' + '普通正文行\n'.repeat(1000) + '最后一行';
+    const expected = longText.replace('星辰科技', '公司A');
+    const editor = page.locator('#ce');
+    await editor.evaluate((el) => {
+      let pasteCount = 0;
+      el.addEventListener('paste', (event) => {
+        event.preventDefault();
+        pasteCount += 1;
+        el.setAttribute('data-paste-count', String(pasteCount));
+        const plain = (event as ClipboardEvent).clipboardData?.getData('text/plain') ?? '';
+        el.textContent = (el.textContent ?? '') + plain;
+      });
+    });
+    await pasteInto(page, '#ce', longText);
+    await expect(page.getByText(/VESPER 已脱敏 1 处/)).toBeVisible({ timeout: 5000 });
+    await expect(editor).toHaveAttribute('data-paste-count', '1');
+    expect(await editor.textContent()).toBe(expected);
+  });
+
+  test('Gemini 风格 Quill 1 编辑器粘贴超长文本时直接走剪贴板兜底，不卡死且二次粘贴直接放行', async ({
+    page,
+  }) => {
+    await setup(page, 'auto', true);
+    const editor = page.locator('#ce');
+    await editor.evaluate((el) => {
+      el.classList.add('ql-editor');
+      const clip = document.createElement('div');
+      clip.className = 'ql-clipboard';
+      el.parentElement!.appendChild(clip);
+    });
+    const huge = '星辰科技\n' + '第 N 行超长日志记录用于测试 Gemini Quill 1 兜底\n'.repeat(1200);
+    const expected = huge.replace('星辰科技', '公司A');
+
+    await pasteInto(page, '#ce', huge);
+    await expect(page.getByText(/文本较长，已复制脱敏结果/)).toBeVisible({ timeout: 5000 });
+    // 首贴未强塞 DOM，避免 Quill 1 O(N²) 假死
+    await expect(editor).toHaveText('');
+    expect(await page.evaluate(() => navigator.clipboard.readText())).toBe(expected);
+
+    // 二次粘贴时由 approvedPaste 原生放行，不再被 VESPER 重复拦截
+    await editor.evaluate((el) => {
+      el.addEventListener(
+        'paste',
+        (event) => {
+          event.preventDefault();
+          el.setAttribute('data-native-paste', '1');
+          el.textContent = (
+            (event as ClipboardEvent).clipboardData?.getData('text/plain') ?? ''
+          ).slice(0, 20);
+        },
+        { once: true },
+      );
+    });
+    await editor.focus();
+    await page.keyboard.press('ControlOrMeta+V');
+    await expect(editor).toHaveAttribute('data-native-paste', '1');
+    expect(await editor.textContent()).toBe(expected.slice(0, 20));
+  });
+
+  test('通用富文本编辑器粘贴超 128KB/2000 行文本直接复制脱敏结果，避免反复分批注入卡死', async ({
+    page,
+  }) => {
+    await setup(page, 'auto', true);
+    const editor = page.locator('#ce');
+    const huge = '星辰科技\n' + '超长富文本行内容用于验证直接复制上限\n'.repeat(2500);
+    const expected = huge.replace('星辰科技', '公司A');
+
+    await pasteInto(page, '#ce', huge);
+    await expect(page.getByText(/文本较长，已复制脱敏结果/)).toBeVisible({ timeout: 5000 });
+    await expect(editor).toHaveText('');
+    expect(await page.evaluate(() => navigator.clipboard.readText())).toBe(expected);
   });
 });
 

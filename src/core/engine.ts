@@ -73,6 +73,7 @@ function compileRule(rule: Rule): { regex: RegExp; group?: number }[] {
       return [{ regex: new RegExp(src, flags) }];
     }
     case 'regex': {
+      if (!rule.pattern) return [];
       let flags = rule.regexFlags ?? 'g';
       if (!flags.includes('g')) flags += 'g';
       return [{ regex: new RegExp(rule.pattern, flags) }];
@@ -88,14 +89,39 @@ function compileRule(rule: Rule): { regex: RegExp; group?: number }[] {
   }
 }
 
-/** 展开 regex 规则的 fixed 模板中的 $1 等捕获组引用 */
+/** 展开 regex 规则的 fixed 模板中的 $$、$<name> 与 $1..$99 等捕获组引用 */
 function expandTemplate(template: string, args: unknown[]): string {
-  const namedGroups = typeof args.at(-1) === 'object';
+  const lastArg = args.at(-1);
+  const namedGroups =
+    lastArg != null && typeof lastArg === 'object'
+      ? (lastArg as Record<string, string | undefined>)
+      : null;
   const lastCapture = args.length - (namedGroups ? 4 : 3);
-  return template.replace(/\$(\d+)/g, (_, d) => {
-    const index = Number(d);
-    const v = index <= lastCapture ? args[index] : undefined;
-    return typeof v === 'string' ? v : '';
+  return template.replace(/\$\$|\$<([^>]+)>|\$(\d{1,2})/g, (match, name?: string, d?: string) => {
+    if (match === '$$') return '$';
+    if (name !== undefined) {
+      if (!namedGroups) return match;
+      return typeof namedGroups[name] === 'string' ? namedGroups[name]! : '';
+    }
+    if (!d) return match;
+    const twoDigit = Number(d);
+    if (d.length === 2) {
+      if (twoDigit >= 1 && twoDigit <= lastCapture) {
+        const v = args[twoDigit];
+        return typeof v === 'string' ? v : '';
+      }
+      const oneDigit = Number(d[0]);
+      if (oneDigit >= 1 && oneDigit <= lastCapture) {
+        const v = args[oneDigit];
+        return (typeof v === 'string' ? v : '') + d[1]!;
+      }
+      return match;
+    }
+    if (twoDigit >= 1 && twoDigit <= lastCapture) {
+      const v = args[twoDigit];
+      return typeof v === 'string' ? v : '';
+    }
+    return match;
   });
 }
 
@@ -107,10 +133,12 @@ export function desensitize(text: string, scheme: Scheme, strict = false): Desen
 
   // Preserve any literal token-shaped input by assigning it a token of its own.
   const literals: string[] = [];
-  let current = text.replace(TOKEN_RE, (literal) => {
-    literals.push(literal);
-    return encodeToken(literals.length - 1);
-  });
+  let current = text.includes(TOKEN_START)
+    ? text.replace(TOKEN_RE, (literal) => {
+        literals.push(literal);
+        return encodeToken(literals.length - 1);
+      })
+    : text;
   const hits: Hit[] = [];
   const finals: string[] = []; // hitIndex -> 最终替换文本
   const mapping = new Map<string, string>();
@@ -203,40 +231,55 @@ export function desensitize(text: string, scheme: Scheme, strict = false): Desen
     }
   }
 
+  if (hits.length === 0 && literals.length === 0) {
+    return { output: text, hits: [], mapping: {}, durationMs: Date.now() - start };
+  }
+
   // 统一回填：令牌 → 最终占位符，同时计算每个命中在输出中的下标
-  let output = '';
+  const chunks: string[] = [];
+  let outputLength = 0;
   let last = 0;
   TOKEN_RE.lastIndex = 0;
   let m: RegExpExecArray | null;
   while ((m = TOKEN_RE.exec(current)) !== null) {
     let index = 0;
     for (const digit of m[1]!) index = index * 10 + digit.charCodeAt(0) - TOKEN_DIGIT;
-    output += current.slice(last, m.index);
+    if (m.index > last) {
+      const prefix = current.slice(last, m.index);
+      chunks.push(prefix);
+      outputLength += prefix.length;
+    }
     if (index < literals.length) {
-      output += literals[index];
+      const lit = literals[index]!;
+      chunks.push(lit);
+      outputLength += lit.length;
     } else {
       const hitIndex = index - literals.length;
-      hits[hitIndex]!.index = output.length;
-      output += finals[hitIndex]!;
+      hits[hitIndex]!.index = outputLength;
+      const rep = finals[hitIndex]!;
+      chunks.push(rep);
+      outputLength += rep.length;
     }
     last = m.index + m[0].length;
   }
-  output += current.slice(last);
+  if (last < current.length) chunks.push(current.slice(last));
+  const output = chunks.join('');
 
   hits.sort((a, b) => a.index - b.index);
   return { output, hits, mapping: Object.fromEntries(mapping), durationMs: Date.now() - start };
 }
 
-/** 规则测试台用：用单条规则对样本文本试跑（非法正则直接向上抛错给编辑器提示） */
+/** 规则测试台用：用单条规则对样本文本试跑（非法正则直接向上抛错给编辑器提示；已停用规则也强制启用测试） */
 export function testRule(sample: string, rule: Rule): DesensitizeResult {
+  const activeRule: Rule = { ...rule, enabled: true };
   // 先编译一次以便尽早抛出语法错误
-  compileRule(rule);
+  compileRule(activeRule);
   const scheme: Scheme = {
     id: '__test__',
     name: '__test__',
     isDefault: false,
     enabled: true,
-    rules: [rule],
+    rules: [activeRule],
     createdAt: 0,
     updatedAt: 0,
   };

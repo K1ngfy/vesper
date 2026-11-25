@@ -24,6 +24,14 @@ export default defineConfig({
   vite: () => ({
     plugins: [tailwindcss()],
   }),
+  hooks: {
+    'build:manifestGenerated': (_wxt, manifest) => {
+      // Chrome MV3 manifest 图标只保留标准尺寸（16/32/48/96/128）；512.png 保留在目录供商店素材使用
+      if (manifest.icons && '512' in manifest.icons) {
+        delete manifest.icons['512'];
+      }
+    },
+  },
   manifest: {
     name: 'VESPER',
     description:
@@ -44,11 +52,23 @@ export default defineConfig({
         description: '打开 VESPER 工作台',
       },
     },
+    // Manifest 图标路径必须使用相对扩展根目录的写法（无前导 /），并显式声明 action.default_icon
+    // 以兼容各版本 Chrome / Edge / Chromium 衍生浏览器的工具栏与扩展管理页图标加载。
     icons: {
-      16: '/icon/16.png',
-      32: '/icon/32.png',
-      48: '/icon/48.png',
-      128: '/icon/128.png',
+      16: 'icon/16.png',
+      32: 'icon/32.png',
+      48: 'icon/48.png',
+      96: 'icon/96.png',
+      128: 'icon/128.png',
+    },
+    action: {
+      default_title: 'VESPER',
+      default_icon: {
+        16: 'icon/16.png',
+        32: 'icon/32.png',
+        48: 'icon/48.png',
+        128: 'icon/128.png',
+      },
     },
   },
 });

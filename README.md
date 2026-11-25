@@ -92,8 +92,8 @@ transmits no data. Your rules and texts never leave your browser.
 
 ## 配色
 
-**极简黑白**（2026-10-25 重构）：背景 `#ffffff`，文本 `#111111`，次级文本 `#6b7280`，
-边框 `#e5e5e5`，主色（按钮/强调/星号）`#111111` 黑。原"深空蓝 + 星芒橙"品牌色已弃用。
+**极简黑白**：背景 `#ffffff`，文本 `#111111`，次级文本 `#6b7280`，
+边框 `#e5e5e5`，主色（按钮/强调/品牌徽标）`#111111` 黑。品牌标志采用「半阖之瞳（Veiled Eye）」纯矢量图形。
 所有颜色集中在 `src/ui/global.css` 的 CSS 变量；改动只需调变量即可全局生效。
 
 ## 这个插件做不了什么 / 合规红线
@@ -106,10 +106,10 @@ transmits no data. Your rules and texts never leave your browser.
 
 ## 图标说明
 
-`public/icon/` 下 16/32/48/96/128/512 PNG 由 `logo.jpg` 生成；替换 logo 后重跑：
+品牌矢量源文件位于 `assets/logo.svg`（纯图形）与 `assets/icon.svg`（圆角图标）；`public/icon/` 下 16/32/48/96/128/512 RGBA PNG 与 `assets/poster_1080.png` 由 `assets/make_assets.py` 统一生成：
 
 ```bash
-for sz in 16 32 48 96 128 512; do sips -s format png -z $sz $sz logo.jpg --out public/icon/$sz.png; done
+python3 assets/make_assets.py
 ```
 
 ## 贡献

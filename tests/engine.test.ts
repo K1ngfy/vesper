@@ -281,6 +281,117 @@ describe('引擎通用行为', () => {
     expect(res.output).toBe('postgres://same:[PASSWORD_1]@example.test/db');
   });
 
+  it('db_conn 不误报带端口且路径包含 @ 的普通 URL', () => {
+    const rule = builtinRule('db_conn');
+    const url = 'https://example.com:8080/users/alice@acme.com';
+    const res = testRule(url, rule);
+    expect(res.hits).toHaveLength(0);
+    expect(res.output).toBe(url);
+  });
+
+  it('testRule 可测试处于停用状态的规则', () => {
+    const disabledRule: Rule = {
+      id: 'k_disabled',
+      type: 'keyword',
+      enabled: false,
+      name: '停用规则',
+      pattern: '星辰科技',
+      replacement: '公司A',
+      mode: 'fixed',
+    };
+    const res = testRule('星辰科技项目', disabledRule);
+    expect(res.output).toBe('公司A项目');
+    expect(res.hits).toHaveLength(1);
+  });
+
+  it('regex 规则替换模板支持 $$ 字面美元符与捕获组共存', () => {
+    const rule: Rule = {
+      id: 'r_dollar',
+      type: 'regex',
+      enabled: true,
+      name: '金额脱敏',
+      pattern: 'ID-(\\d+)',
+      replacement: '$$100-$1',
+      mode: 'fixed',
+      regexFlags: 'g',
+    };
+    const res = testRule('订单 ID-42 完成', rule);
+    expect(res.output).toBe('订单 $100-42 完成');
+  });
+
+  it('regex 规则模板 $0 不泄露原敏感值，且支持 $1 后紧接数字与命名捕获组', () => {
+    const zeroRule: Rule = {
+      id: 'r_zero',
+      type: 'regex',
+      enabled: true,
+      name: '价格置零',
+      pattern: '\\$\\d+(?:\\.\\d+)?',
+      replacement: '$0.00',
+      mode: 'fixed',
+    };
+    expect(testRule('报价 $999.99', zeroRule).output).toBe('报价 $0.00');
+
+    const digitSuffixRule: Rule = {
+      id: 'r_suffix',
+      type: 'regex',
+      enabled: true,
+      name: '手机号保留号段',
+      pattern: '(1[3-9]\\d)\\d{8}',
+      replacement: '$100000000',
+      mode: 'fixed',
+    };
+    expect(testRule('电话 13812345678', digitSuffixRule).output).toBe('电话 13800000000');
+
+    const namedRule: Rule = {
+      id: 'r_named',
+      type: 'regex',
+      enabled: true,
+      name: '命名组脱敏',
+      pattern: '(?<prefix>EMP-)\\d+',
+      replacement: '$<prefix>***',
+      mode: 'fixed',
+    };
+    expect(testRule('员工 EMP-9527', namedRule).output).toBe('员工 EMP-***');
+  });
+
+  it('空 regex pattern 安全跳过，不产生空匹配遍历', () => {
+    const scheme: Scheme = {
+      ...fixtureScheme(),
+      rules: [
+        {
+          id: 'r_empty',
+          type: 'regex',
+          enabled: true,
+          name: '空正则',
+          pattern: '',
+          replacement: 'X',
+          mode: 'fixed',
+        },
+      ],
+    };
+    const res = desensitize('abc', scheme, true);
+    expect(res.output).toBe('abc');
+    expect(res.hits).toHaveLength(0);
+  });
+
+  it('JSON 键值与含分号引号密码、+86 手机号、JSON Bearer 头可准确脱敏', () => {
+    const scheme: Scheme = {
+      ...fixtureScheme(),
+      rules: [
+        builtinRule('phone_cn'),
+        builtinRule('db_conn'),
+        builtinRule('bearer'),
+        builtinRule('generic_secret'),
+      ],
+    };
+    const sample =
+      '{"password": "p@ss;word,123", "api_key": "sec_val", "Authorization": "Bearer tok_xyz"} 电话 +8613812345678';
+    const res = desensitize(sample, scheme, true);
+    expect(res.output).toBe(
+      '{"password": "[PASSWORD_1]", "api_key": "[SECRET_1]", "Authorization": "Bearer [TOKEN_1]"} 电话 [PHONE_1]',
+    );
+  });
+
   it('性能基线：100KB 文本 + 默认多规则 < 100ms', () => {
     const big = FIXTURE_INPUT.repeat(3000); // ~450KB 级文本
     const res = desensitize(big, fixtureScheme());

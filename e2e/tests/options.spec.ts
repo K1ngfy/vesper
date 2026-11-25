@@ -106,4 +106,94 @@ test('站点拦截：弹窗添加站点入列 + 空域名校验', async ({ extCt
   await expect(hostInput).toHaveCount(0);
   await expect(page.getByText('已添加站点，请点击其开关启用并授予域名权限')).toBeVisible();
   await expect(page.locator('span.font-mono', { hasText: 'example.com' }).first()).toBeVisible();
+
+  // 重复添加同一域名：弹窗内明确提示重复，且点击遮罩不误关
+  await page.getByRole('button', { name: '添加站点' }).click();
+  const siteModal = page.getByTestId('add-site-modal');
+  await expect(siteModal).toBeVisible();
+  await siteModal.getByPlaceholder('*.example.com').fill('example.com');
+  await siteModal.getByRole('button', { name: '新增', exact: true }).click();
+  await expect(siteModal.getByText('该域名已在列表中，请勿重复添加')).toBeVisible();
+  await siteModal.click({ position: { x: 8, y: 8 } });
+  await expect(siteModal).toBeVisible();
+  await siteModal.getByRole('button', { name: '关闭' }).click();
+  await expect(siteModal).toHaveCount(0);
+});
+
+test('规则逐条展示、弹窗点击外部不误关、支持编辑已有规则与多行测试预览', async ({
+  extCtx,
+  extensionId,
+}) => {
+  const page = await openOptions(extCtx, extensionId);
+
+  // 1) 验证规则为单列逐条排布（各行左对齐、纵坐标严格递增）
+  const rows = page.locator('[draggable="true"]');
+  const firstBox = (await rows.nth(0).boundingBox())!;
+  const secondBox = (await rows.nth(1).boundingBox())!;
+  expect(Math.abs(firstBox.x - secondBox.x)).toBeLessThan(2);
+  expect(secondBox.y).toBeGreaterThan(firstBox.y + firstBox.height - 2);
+
+  // 2) 新建规则弹窗中框选/点击遮罩边缘不误关闭，已填内容不丢失
+  await page.getByText('+ 关键词').click();
+  const modal = page.getByTestId('add-rule-modal');
+  await expect(modal).toBeVisible();
+  const patternInput = modal.getByPlaceholder('精确关键词原文');
+  await patternInput.fill('绝密代号');
+  await modal.getByPlaceholder(/替换文本/).fill('[CODE]');
+  // 点击遮罩左上角边缘
+  await modal.click({ position: { x: 8, y: 8 } });
+  await expect(modal).toBeVisible();
+  await expect(patternInput).toHaveValue('绝密代号');
+
+  // 3) 大尺寸多行测试框实时高亮预览并统计命中数
+  const testInput = modal.getByTestId('rule-test-input');
+  await testInput.fill('第一行：绝密代号启动\n第二行：确认绝密代号无误');
+  const testOutput = modal.getByTestId('rule-test-output');
+  await expect(modal.getByText('命中 2 处')).toBeVisible({ timeout: 5000 });
+  await expect(testOutput.locator('mark')).toHaveCount(2);
+  await expect(testOutput).toContainText('第一行：[CODE]启动');
+  await expect(testOutput).toContainText('第二行：确认[CODE]无误');
+
+  await page.getByTestId('confirm-add-rule').click();
+  await expect(modal).toHaveCount(0);
+
+  // 4) 先停用刚新建的规则，再点击其「编辑」按钮修改并在弹窗内测试（停用规则也可测试）
+  const lastRow = rows.last();
+  await lastRow.getByRole('switch').click();
+  await expect(lastRow.getByRole('switch')).toHaveAttribute('aria-checked', 'false');
+  await lastRow.getByRole('button', { name: '编辑' }).click();
+
+  const editModal = page.getByTestId('add-rule-modal');
+  await expect(editModal.getByText('编辑规则')).toBeVisible();
+  await editModal.getByPlaceholder('规则名称（可选，便于识别）').fill('代号脱敏');
+  await editModal.getByPlaceholder(/替换文本/).fill('[SECRET_CODE]');
+  await editModal.getByTestId('rule-test-input').fill('测试绝密代号');
+  await expect(editModal.getByText('命中 1 处')).toBeVisible({ timeout: 5000 });
+  await expect(editModal.getByTestId('rule-test-output')).toContainText('测试[SECRET_CODE]');
+
+  await editModal.getByTestId('confirm-add-rule').click();
+  await expect(editModal).toHaveCount(0);
+  await expect(lastRow).toContainText('代号脱敏');
+  await expect(lastRow).toContainText('[SECRET_CODE]');
+});
+
+test('站点拦截：批量绑定方案可正确切回「跟随当前方案」', async ({ extCtx, extensionId }) => {
+  const page = await openOptions(extCtx, extensionId);
+  await page.getByText('站点拦截').click();
+
+  // 选中第一行站点（*.chatgpt.com），先将其显式绑定到「默认方案」
+  const firstSiteRow = page.locator('div.grid', { hasText: '*.chatgpt.com' }).first();
+  await firstSiteRow.locator('input[type="checkbox"]').check();
+  const batchSchemeSelect = page.getByLabel('绑定方案');
+  await expect(batchSchemeSelect).toBeVisible();
+  const defaultOptionValue = await batchSchemeSelect
+    .locator('option', { hasText: '默认方案' })
+    .getAttribute('value');
+  await batchSchemeSelect.selectOption(defaultOptionValue!);
+  await expect(firstSiteRow.locator('select').first()).toHaveValue(defaultOptionValue!);
+
+  // 再次勾选，批量切回「跟随当前方案」
+  await firstSiteRow.locator('input[type="checkbox"]').check();
+  await page.getByLabel('绑定方案').selectOption({ label: '跟随当前方案' });
+  await expect(firstSiteRow.locator('select').first()).toHaveValue('');
 });

@@ -78,6 +78,10 @@ const SCHEMA_VERSION = 8;
 
 /** 首次安装播种：默认方案 + 预置站点（未启用）+ 默认设置；含 schema 版本标记 */
 export async function ensureSeeded(): Promise<void> {
+  return navigator.locks.request('vesper:seed', doEnsureSeeded);
+}
+
+async function doEnsureSeeded(): Promise<void> {
   const meta = await get<{ schemaVersion: number }>(KEYS.meta);
   if (meta?.schemaVersion === SCHEMA_VERSION) return;
 
@@ -128,7 +132,7 @@ export async function ensureSeeded(): Promise<void> {
     const next = allSites.map((s) => {
       if (s.category) return s;
       changed = true;
-      return { ...s, category: PRESET_HOST_CATEGORY[s.host] ?? 'custom' };
+      return { ...s, category: PRESET_HOST_CATEGORY[normalizeHost(s.host)] ?? 'custom' };
     });
     if (changed) await saveSites(next);
   }
@@ -188,11 +192,11 @@ export async function ensureSeeded(): Promise<void> {
     const allSchemes = await getSchemes();
     const defaultId = allSchemes.find((s) => s.isDefault)?.id;
     if (defaultId) {
-      const presetHosts = PRESET_SITES.map((s) => s.host);
+      const presetHosts = new Set(PRESET_SITES.map((s) => normalizeHost(s.host)));
       const allSites = await getSites();
       let changed = false;
       const next = allSites.map((s) => {
-        if (s.host && presetHosts.includes(s.host) && s.schemeId === defaultId) {
+        if (s.host && presetHosts.has(normalizeHost(s.host)) && s.schemeId === defaultId) {
           changed = true;
           return { ...s, schemeId: FOLLOW_ACTIVE_SCHEME };
         }
@@ -323,6 +327,46 @@ export function hostToOrigins(host: string): string[] {
   return [`*://${base}/*`, `*://*.${base}/*`];
 }
 
+/** 域名/通配模式校验：接受 example.com、*.example.com、*、localhost、合法 IPv4 与 [IPv6]；拒绝协议/路径及非法数值后缀 */
+export function isValidHostPattern(input: string): boolean {
+  const v = input.trim().toLowerCase().replace(/\.$/, '');
+  if (v === '*' || v === 'localhost') return true;
+  if (v.startsWith('[')) {
+    if (!v.endsWith(']') || !v.includes(':')) return false;
+    try {
+      return new URL(`http://${v}`).hostname.toLowerCase() === v;
+    } catch {
+      return false;
+    }
+  }
+  if (ipv4ToInt(v) !== null) return true;
+  const base = v.startsWith('*.') ? v.slice(2) : v;
+  if (!base || base.length > 253) return false;
+  const labels = base.split('.');
+  if (labels.length < 2) return false;
+  // 顶级域不得为纯数字（URL 标准将末段纯数字按 IPv4 解析，非法网段会导致权限申请抛异常）
+  if (/^\d+$/.test(labels.at(-1)!)) return false;
+  return labels.every((l) => /^[a-z0-9-]{1,63}$/.test(l) && !l.startsWith('-') && !l.endsWith('-'));
+}
+
+/** 计算可安全撤销的 origins（不误撤其他已启用父级通配站点或全局模式仍需的权限） */
+export function getRemovableOrigins(
+  removingSites: SiteRule[],
+  remainingSites: SiteRule[],
+  currentScope: SiteScope,
+): string[] {
+  if (currentScope === 'global') return [];
+  const activeRemaining = remainingSites.filter((s) => s.enabled);
+  const stillNeeded = new Set(activeRemaining.flatMap((s) => hostToOrigins(s.host)));
+  if (stillNeeded.has('*://*/*')) return [];
+  const unsubsumedRemoving = removingSites.filter((rem) => {
+    const remHost = normalizeHost(rem.host);
+    return !activeRemaining.some((keep) => hostMatches(remHost, keep.host));
+  });
+  const candidates = new Set(unsubsumedRemoving.flatMap((s) => hostToOrigins(s.host)));
+  return [...candidates].filter((origin) => !stillNeeded.has(origin));
+}
+
 /** 从旧 matchPattern（*://host/* 或 *://*.host/*）提取根域 host；失败返回空串（迁移用） */
 export function matchPatternToHost(pattern: string): string {
   const m = pattern.match(/^\*{0,2}[a-z*]+:\/\/(\*\.)?([^/\s]+)\/\*?$/i);
@@ -339,6 +383,11 @@ export async function updateSettings(patch: Partial<Settings>): Promise<void> {
   return navigator.locks.request('vesper:settings', async () => {
     const current = await getSettings();
     if (current) await set(KEYS.settings, { ...current, ...patch });
+    if (patch.persistMappings === false) {
+      await navigator.locks.request(MAPPING_HISTORY_KEY, async () => {
+        await chrome.storage.local.remove(MAPPING_HISTORY_KEY);
+      });
+    }
   });
 }
 
@@ -442,7 +491,7 @@ export function validateImport(data: unknown): string | null {
   ) {
     return '设置结构不合法';
   }
-  if (!Array.isArray(d.schemes)) return '缺少方案列表';
+  if (!Array.isArray(d.schemes) || d.schemes.length === 0) return '缺少方案列表';
   const schemeIds = new Set<string>();
   for (const s of d.schemes) {
     if (
@@ -482,7 +531,9 @@ export function validateImport(data: unknown): string | null {
       if (r.type === 'builtin' && !getDetector(r.pattern)) return '未知的内置检测器';
       if (r.type === 'regex') {
         try {
-          new RegExp(r.pattern, r.regexFlags);
+          let flags = r.regexFlags ?? 'g';
+          if (!flags.includes('g')) flags += 'g';
+          new RegExp(r.pattern, flags);
         } catch {
           return '规则中包含无效的正则表达式';
         }
@@ -491,17 +542,25 @@ export function validateImport(data: unknown): string | null {
     }
   }
   if (!Array.isArray(d.sites)) return '缺少站点列表';
+  const categories = ['ai', 'search', 'translate', 'custom'];
   const siteIds = new Set<string>();
   for (const s of d.sites) {
+    const resolvedHost =
+      typeof s?.host === 'string' && s.host.trim()
+        ? s.host.trim()
+        : d.schemaVersion! < 3 && typeof s?.matchPattern === 'string'
+          ? matchPatternToHost(s.matchPattern)
+          : '';
     if (
       typeof s?.id !== 'string' ||
       !s.id ||
       siteIds.has(s.id) ||
-      typeof s.host !== 'string' ||
-      !s.host.trim() ||
+      !resolvedHost ||
       typeof s.enabled !== 'boolean' ||
       typeof s.schemeId !== 'string' ||
       !modes.includes(s.mode) ||
+      (s.name !== undefined && typeof s.name !== 'string') ||
+      (s.category !== undefined && !categories.includes(s.category)) ||
       (s.selector !== undefined && typeof s.selector !== 'string')
     ) {
       return '站点结构不合法';
@@ -516,18 +575,48 @@ export async function importAll(bundle: ExportBundle): Promise<void> {
   if (err) throw new Error(err);
   await navigator.locks.request('vesper:settings', async () => {
     const current = await getSettings();
+    let seenDefault = false;
+    const normalizedSchemes = bundle.schemes.map((s) => {
+      if (s.isDefault && !seenDefault) {
+        seenDefault = true;
+        return s;
+      }
+      return s.isDefault ? { ...s, isDefault: false } : s;
+    });
+    if (!seenDefault && normalizedSchemes[0]) {
+      normalizedSchemes[0] = { ...normalizedSchemes[0], isDefault: true };
+    }
+    const defaultScheme = normalizedSchemes.find((s) => s.isDefault) ?? normalizedSchemes[0]!;
+    const activeSchemeId = normalizedSchemes.some((s) => s.id === bundle.settings.activeSchemeId)
+      ? bundle.settings.activeSchemeId
+      : defaultScheme.id;
+    const normalizedSites = bundle.sites.map((s) => {
+      const host = s.host?.trim() || matchPatternToHost(s.matchPattern ?? '');
+      return {
+        ...s,
+        host,
+        matchPattern: undefined,
+        category: s.category ?? PRESET_HOST_CATEGORY[normalizeHost(host)] ?? 'custom',
+      };
+    });
     const settings: Settings = {
       ...bundle.settings,
+      activeSchemeId,
       siteScope: bundle.settings.siteScope ?? 'list',
       globalMode: bundle.settings.globalMode ?? 'preview',
       excludeHosts: bundle.settings.excludeHosts ?? [...DEFAULT_EXCLUDE_HOSTS],
       dailyCount: current?.dailyCount ?? { date: today(), count: 0 },
     };
     await chrome.storage.local.set({
-      [KEYS.schemes]: bundle.schemes,
-      [KEYS.sites]: bundle.sites,
+      [KEYS.schemes]: normalizedSchemes,
+      [KEYS.sites]: normalizedSites,
       [KEYS.settings]: settings,
     });
+    if (!settings.persistMappings) {
+      await navigator.locks.request(MAPPING_HISTORY_KEY, async () => {
+        await chrome.storage.local.remove(MAPPING_HISTORY_KEY);
+      });
+    }
   });
 }
 

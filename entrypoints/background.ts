@@ -27,6 +27,7 @@ import {
 import type { SiteStateResponse } from '@/src/messages';
 import { genId } from '@/src/core/presets';
 import { restore } from '@/src/core/restore';
+import { VESPER_LOGO_PATHS, VESPER_LOGO_VIEWBOX } from '@/src/brand';
 
 const ENGINE_PAGE = '/engine.html';
 let openingEngine: Promise<void> | undefined;
@@ -59,9 +60,23 @@ function ensureEnginePage(): Promise<void> {
   }));
 }
 
-/** 打开工作台页（新标签页） */
+/** 打开工作台页（优先复用已有工作台标签页，避免重复堆积多个标签） */
 async function openWorkbench(): Promise<void> {
-  await chrome.tabs.create({ url: chrome.runtime.getURL('/workbench.html') });
+  const url = chrome.runtime.getURL('/workbench.html');
+  try {
+    const existing = await chrome.tabs.query({ url });
+    const tab = existing.find((t) => t.id != null);
+    if (tab?.id != null) {
+      await chrome.tabs.update(tab.id, { active: true });
+      if (tab.windowId != null) {
+        await chrome.windows.update(tab.windowId, { focused: true }).catch(() => {});
+      }
+      return;
+    }
+  } catch {
+    // 降级新建标签页
+  }
+  await chrome.tabs.create({ url });
 }
 
 /**
@@ -80,25 +95,53 @@ async function handleRestoreSelection(
   await chrome.scripting
     .executeScript({
       target: { tabId: tab.id, frameIds: [info.frameId ?? 0] },
-      func: async (payload: { text: string; changed: boolean }) => {
+      func: async (payload: {
+        text: string;
+        changed: boolean;
+        logoViewBox: string;
+        logoPaths: readonly string[];
+      }) => {
         const copied =
           payload.changed &&
           (await navigator.clipboard?.writeText(payload.text).then(
             () => true,
             () => false,
           ));
+        document.getElementById('vesper-restore-tip')?.remove();
         const tip = document.createElement('div');
-        tip.textContent = payload.changed
+        tip.id = 'vesper-restore-tip';
+        const svgNs = 'http://www.w3.org/2000/svg';
+        const svg = document.createElementNS(svgNs, 'svg');
+        svg.setAttribute('viewBox', payload.logoViewBox);
+        svg.setAttribute('width', '16');
+        svg.setAttribute('height', '16');
+        svg.setAttribute('fill', 'currentColor');
+        svg.setAttribute('aria-hidden', 'true');
+        svg.style.cssText = 'display:inline-block;flex:none;vertical-align:middle;';
+        for (const d of payload.logoPaths) {
+          const path = document.createElementNS(svgNs, 'path');
+          path.setAttribute('d', d);
+          svg.appendChild(path);
+        }
+        const msg = payload.changed
           ? copied
-            ? '✳ VESPER 已还原并复制'
-            : '✳ 已还原，但写入剪贴板失败'
-          : '✳ 未检测到可还原的占位符（请先用 VESPER 脱敏）';
+            ? 'VESPER 已还原并复制'
+            : '已还原，但写入剪贴板失败'
+          : '未检测到可还原的占位符（请先用 VESPER 脱敏）';
+        tip.append(svg, document.createTextNode(msg));
         tip.style.cssText =
-          'position:fixed;top:16px;right:16px;z-index:2147483647;background:#111111;color:#ffffff;padding:10px 14px;border-radius:8px;font:13px -apple-system,"PingFang SC",sans-serif;box-shadow:0 8px 24px rgba(0,0,0,.2);';
+          'position:fixed;top:16px;right:16px;z-index:2147483647;display:inline-flex;align-items:center;gap:6px;background:#111111;color:#ffffff;padding:10px 14px;border-radius:8px;font:13px -apple-system,"PingFang SC",sans-serif;box-shadow:0 8px 24px rgba(0,0,0,.2);';
         document.documentElement.appendChild(tip);
         setTimeout(() => tip.remove(), 2500);
       },
-      args: [{ text: restored, changed }],
+      args: [
+        {
+          text: restored,
+          changed,
+          logoViewBox: VESPER_LOGO_VIEWBOX,
+          logoPaths: [...VESPER_LOGO_PATHS],
+        },
+      ],
     })
     .catch(() => {});
 }
@@ -274,6 +317,9 @@ export default defineBackground(() => {
           const settings = await getSettings();
           // 总开关关闭：仍返回站点信息供 Popup 展示，但状态为 disabled
           if (settings?.globalEnabled === false) {
+            if ((settings.siteScope ?? 'list') === 'global') {
+              return { status: 'disabled' } satisfies SiteStateResponse;
+            }
             const site = await findSiteByUrl(msg.url);
             return (
               site ? { status: 'disabled', site } : { status: 'unconfigured' }
@@ -291,7 +337,12 @@ export default defineBackground(() => {
             const granted = await chrome.permissions.contains({ origins: ['*://*/*'] });
             if (!granted) return { status: 'no-permission' } satisfies SiteStateResponse;
             const scheme = await getActiveScheme();
-            if (!scheme) return { status: 'disabled' } satisfies SiteStateResponse;
+            if (!scheme || !scheme.enabled) {
+              return {
+                status: 'disabled',
+                ...(scheme ? { scheme } : {}),
+              } satisfies SiteStateResponse;
+            }
             // 全局模式无具体站点，构造虚拟站点（拦截模式跟随用户配置）；scheme 用当前方案
             return {
               status: 'enabled',
@@ -313,12 +364,21 @@ export default defineBackground(() => {
           const siteOrigins = hostToOrigins(site.host);
           const granted = await chrome.permissions.contains({ origins: siteOrigins });
           if (!granted) return { status: 'no-permission', site } satisfies SiteStateResponse;
+          const schemes = await getSchemes();
           const scheme =
             // schemeId 为空 = 跟随当前方案（Popup 切换即生效）；
             // 非空但已失效（方案被删）时同样回退当前方案
-            (await getSchemes()).find((s) => s.id === site.schemeId && site.schemeId !== '') ??
-            (await getActiveScheme());
-          if (!scheme) return { status: 'disabled', site } satisfies SiteStateResponse;
+            schemes.find((s) => s.id === site.schemeId && site.schemeId !== '') ??
+            schemes.find((s) => s.id === settings?.activeSchemeId) ??
+            schemes.find((s) => s.isDefault) ??
+            schemes[0];
+          if (!scheme || !scheme.enabled) {
+            return {
+              status: 'disabled',
+              site,
+              ...(scheme ? { scheme } : {}),
+            } satisfies SiteStateResponse;
+          }
           return { status: 'enabled', site, scheme } satisfies SiteStateResponse;
         }
         case 'INCREMENT_COUNT':

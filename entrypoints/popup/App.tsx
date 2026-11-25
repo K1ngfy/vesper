@@ -20,6 +20,7 @@ import {
 import { genId, normalizeHost } from '@/src/core/presets';
 import { t } from '@/src/i18n';
 import Toggle from '@/src/ui/Toggle';
+import VesperLogo from '@/src/ui/VesperLogo';
 
 const STATUS_CLS: Record<string, string> = {
   enabled: 'text-black',
@@ -53,9 +54,13 @@ export default function App() {
       ]);
       if (settings) {
         setGlobalEnabled(settings.globalEnabled);
-        setSchemeId(settings.activeSchemeId);
         setScope(settings.siteScope ?? 'list');
       }
+      const effectiveScheme =
+        list.find((s) => s.id === settings?.activeSchemeId) ??
+        list.find((s) => s.isDefault) ??
+        list[0];
+      setSchemeId(effectiveScheme?.id ?? '');
       setSchemes(list);
       setCount(c);
       await refreshSiteState();
@@ -149,13 +154,17 @@ export default function App() {
           ? t.popup.siteNoPermission
           : t.popup.siteUnconfigured;
 
-  // 渐进授权按钮：list 模式下未配置/无权限可一键启用当前站点；
+  // 渐进授权按钮：总开关开启时，list 模式下未配置/无权限/站点未启用可一键启用当前站点；
   // global 模式下无 *://*/* 权限可一键开启全局拦截。
   const canEnableHere =
+    globalEnabled &&
     !!activeHost &&
     scope === 'list' &&
-    (statusKey === 'unconfigured' || statusKey === 'no-permission');
-  const canEnableGlobal = !!activeHost && scope === 'global' && statusKey === 'no-permission';
+    (statusKey === 'unconfigured' ||
+      statusKey === 'no-permission' ||
+      (statusKey === 'disabled' && siteState?.site?.enabled === false));
+  const canEnableGlobal =
+    globalEnabled && !!activeHost && scope === 'global' && statusKey === 'no-permission';
   const modeLabel =
     siteState?.site &&
     {
@@ -163,7 +172,7 @@ export default function App() {
       auto: t.options.modeAuto,
       'warn-only': t.options.modeWarnOnly,
     }[siteState.site.mode];
-  const showEnableButton = !busy && (canEnableHere || canEnableGlobal);
+  const showEnableButton = canEnableHere || canEnableGlobal;
   const enableLabel = busy
     ? t.popup.enabling
     : canEnableGlobal
@@ -174,8 +183,9 @@ export default function App() {
   return (
     <div className="w-72 p-4" style={{ background: 'var(--vesper-bg-2)' }}>
       <div className="mb-1 flex items-center justify-between">
-        <span className="text-base font-bold">
-          <span style={{ color: 'var(--vesper-accent)' }}>✳</span> {t.appName}
+        <span className="inline-flex items-center gap-1.5 text-base font-bold">
+          <VesperLogo size={20} />
+          <span>{t.appName}</span>
         </span>
         <div className="flex items-center gap-1.5 text-xs text-[var(--vesper-text-dim)]">
           <span className="cursor-pointer" onClick={() => void toggleGlobal()}>
@@ -201,6 +211,7 @@ export default function App() {
             <option key={s.id} value={s.id}>
               {s.name}
               {s.isDefault ? `（${t.common.defaultTag}）` : ''}
+              {!s.enabled ? `（${t.common.disabled}）` : ''}
             </option>
           ))}
         </select>
@@ -216,7 +227,8 @@ export default function App() {
 
       {showEnableButton && (
         <button
-          className="mb-3 w-full rounded-md bg-black px-3 py-2 text-xs font-medium text-white hover:brightness-150"
+          disabled={busy}
+          className="mb-3 w-full rounded-md bg-black px-3 py-2 text-xs font-medium text-white hover:brightness-150 disabled:cursor-wait disabled:opacity-60"
           onClick={() => void onEnable()}
         >
           {enableLabel}

@@ -34,6 +34,7 @@ let refreshRetry: ReturnType<typeof setTimeout> | undefined;
 let refreshOnPaste = false;
 let pasteId = 0;
 let processing: AbortController | undefined;
+let warnController: AbortController | undefined;
 let approvedPaste: { target: HTMLElement; text: string; expires: number } | undefined;
 let approvalTimer: ReturnType<typeof setTimeout> | undefined;
 
@@ -46,6 +47,8 @@ let releasePreview: (() => void) | undefined;
 function cancelPaste(): void {
   pasteId += 1;
   processing?.abort();
+  warnController?.abort();
+  warnController = undefined;
   closePreview();
   releasePreview?.();
   releasePreview = undefined;
@@ -132,7 +135,17 @@ function onDrop(e: DragEvent, adapter: Adapter): void {
 }
 
 const WORKER_THRESHOLD = 12 * 1024;
+// 预留安全余量，避免超大文本在 Chrome 64MiB 扩展消息上限内序列化失败或拖卡宿主主线程。
+const MAX_PASTE_CHARS = 15 * 1024 * 1024;
 const MIN_PROCESSING_DISPLAY_MS = 300;
+
+function totalHits(res: DesensitizeResult): number {
+  return res.hitCount ?? res.hits.length;
+}
+
+function sameClipboardText(a: string, b: string): boolean {
+  return a === b || a.replace(/\r\n?/g, '\n') === b.replace(/\r\n?/g, '\n');
+}
 
 function desensitizeInExtension(
   text: string,
@@ -197,8 +210,14 @@ async function runPasteEngine(text: string, scheme: Scheme): Promise<Desensitize
 function handleIntercept(text: string | undefined, event: Event, adapter: Adapter): void {
   if (!text) return;
   if (event.defaultPrevented || !event.cancelable || !event.isTrusted) return;
-  const source = event.composedPath()[0];
-  if (!(source instanceof HTMLElement) || isOwnUI(event.target)) return;
+  const rawSource = event.composedPath()[0];
+  const source =
+    rawSource instanceof HTMLElement
+      ? rawSource
+      : rawSource instanceof Node
+        ? rawSource.parentElement
+        : null;
+  if (!source || isOwnUI(event.target)) return;
   const current = ctx;
   if (refreshOnPaste) void refreshCtx();
   if (!current?.scheme.enabled || !current.scheme.rules.some((r) => r.enabled)) return;
@@ -211,9 +230,17 @@ function handleIntercept(text: string | undefined, event: Event, adapter: Adapte
     event.type === 'paste' &&
     approved.expires > Date.now() &&
     approved.target === target &&
-    approved.text === text
+    sameClipboardText(approved.text, text)
   )
     return;
+
+  if (text.length > MAX_PASTE_CHARS) {
+    if (current.site.mode === 'warn-only') return;
+    event.preventDefault();
+    event.stopImmediatePropagation();
+    showToast(t.content.pasteTooLarge);
+    return;
+  }
 
   // Custom regexps can block even on short input. Built-in and literal rules retain
   // native paste for short text with no matches.
@@ -227,6 +254,30 @@ function handleIntercept(text: string | undefined, event: Event, adapter: Adapte
     // Retry in the extension worker and surface a failure if it cannot complete.
   }
   if (result?.hits.length === 0) return;
+
+  // 仅提醒模式：绝不阻止原生粘贴（完整保留富文本格式、附件转换与撤销历史），仅异步/同步检测并弹提醒
+  if (current.site.mode === 'warn-only') {
+    warnController?.abort();
+    warnController = undefined;
+    if (result) {
+      const count = totalHits(result);
+      if (count > 0) showToast(t.content.toastWarn(count));
+      return;
+    }
+    const controller = new AbortController();
+    warnController = controller;
+    void desensitizeInExtension(text, current.scheme, controller.signal)
+      .then((res) => {
+        if (warnController !== controller) return;
+        warnController = undefined;
+        const count = totalHits(res);
+        if (count > 0) showToast(t.content.toastWarn(count));
+      })
+      .catch(() => {
+        if (warnController === controller) warnController = undefined;
+      });
+    return;
+  }
 
   event.preventDefault();
   event.stopImmediatePropagation();
@@ -249,10 +300,11 @@ async function processPaste(
     const res = result ?? (await runPasteEngine(original, current.scheme));
     if (result) await new Promise<void>((resolve) => setTimeout(resolve, 0));
     if (!isCurrent()) return;
-    if (res.hits.length === 0 || mode === 'warn-only') {
+    const hitCount = totalHits(res);
+    if (hitCount === 0 || mode === 'warn-only') {
       const outcome = await insertOrCopy(insertion, original, false, isCurrent);
-      if (outcome === 'inserted' && isCurrent() && res.hits.length > 0) {
-        showToast(t.content.toastWarn(res.hits.length));
+      if (outcome === 'inserted' && isCurrent() && hitCount > 0) {
+        showToast(t.content.toastWarn(hitCount));
       }
     } else if (mode === 'auto') {
       await applyDesensitized(insertion, res, current.scheme.id, isCurrent);
@@ -273,10 +325,16 @@ async function processPaste(
       releasePreview = release;
       awaitingConfirmation = true;
     }
-  } catch {
+  } catch (error) {
     if (!isCurrent()) return;
-    if (mode === 'warn-only') await insertOrCopy(insertion, original, false, isCurrent);
-    else showToast(t.content.previewFailed);
+    if (mode === 'warn-only') {
+      await insertOrCopy(insertion, original, false, isCurrent);
+    } else {
+      const msg = error instanceof Error ? error.message : String(error);
+      showToast(
+        /context invalidated/i.test(msg) ? t.content.contextInvalidated : t.content.previewFailed,
+      );
+    }
   } finally {
     if (!awaitingConfirmation) insertion.release();
   }
@@ -296,10 +354,12 @@ async function insertOrCopy(
     }
   }, 200);
   let offset = 0;
+  let tooLarge = false;
   try {
-    const remaining = await insertion.insert(text, isCurrent);
-    if (remaining === null) return 'inserted';
-    offset = remaining;
+    const outcome = await insertion.insert(text, isCurrent);
+    if (outcome.status === 'inserted') return 'inserted';
+    if (outcome.status === 'too-large') tooLarge = true;
+    else offset = outcome.offset;
   } catch {
     // The destination may have changed while the preview was open.
   } finally {
@@ -318,9 +378,13 @@ async function insertOrCopy(
     showToast(
       offset > 0
         ? t.content.partialCopied
-        : redacted
-          ? t.content.fallbackCopied
-          : t.content.originalCopied,
+        : tooLarge
+          ? redacted
+            ? t.content.largeCopied
+            : t.content.largeOriginalCopied
+          : redacted
+            ? t.content.fallbackCopied
+            : t.content.originalCopied,
     );
     return 'copied';
   } catch {
@@ -341,9 +405,11 @@ async function applyDesensitized(
   if (outcome === 'inserted') {
     const undo = insertion.getUndo();
     showToast(
-      t.content.toastDesensitized(res.hits.length),
+      t.content.toastDesensitized(totalHits(res)),
       undo ? { onUndo: undo.undo, onDismiss: undo.dispose } : {},
     );
+    void sendMessage({ type: 'INCREMENT_COUNT' }).catch(() => {});
+  } else if (outcome === 'copied') {
     void sendMessage({ type: 'INCREMENT_COUNT' }).catch(() => {});
   }
 }

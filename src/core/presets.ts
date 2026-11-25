@@ -128,12 +128,36 @@ export const PRESET_SITES: Omit<SiteRule, 'id'>[] = [
   { host: '*.so.com', schemeId: '', enabled: true, mode: 'preview', category: 'search' },
   { host: '*.duckduckgo.com', schemeId: '', enabled: true, mode: 'preview', category: 'search' },
   // 翻译（整段粘贴风险高）
-  { host: '*.translate.google.com', schemeId: '', enabled: true, mode: 'preview', category: 'translate' },
+  {
+    host: '*.translate.google.com',
+    schemeId: '',
+    enabled: true,
+    mode: 'preview',
+    category: 'translate',
+  },
   { host: '*.deepl.com', schemeId: '', enabled: true, mode: 'preview', category: 'translate' },
-  { host: '*.fanyi.baidu.com', schemeId: '', enabled: true, mode: 'preview', category: 'translate' },
-  { host: '*.fanyi.youdao.com', schemeId: '', enabled: true, mode: 'preview', category: 'translate' },
+  {
+    host: '*.fanyi.baidu.com',
+    schemeId: '',
+    enabled: true,
+    mode: 'preview',
+    category: 'translate',
+  },
+  {
+    host: '*.fanyi.youdao.com',
+    schemeId: '',
+    enabled: true,
+    mode: 'preview',
+    category: 'translate',
+  },
   { host: '*.fanyi.qq.com', schemeId: '', enabled: true, mode: 'preview', category: 'translate' },
-  { host: '*.fanyi.volcengine.com', schemeId: '', enabled: true, mode: 'preview', category: 'translate' },
+  {
+    host: '*.fanyi.volcengine.com',
+    schemeId: '',
+    enabled: true,
+    mode: 'preview',
+    category: 'translate',
+  },
 ];
 
 /** 规范化 host → 分类映射（迁移补 category 用；键不带通配前缀） */

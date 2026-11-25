@@ -35,21 +35,41 @@ function within(el: HTMLElement, range: Range): boolean {
   return el.contains(range.startContainer) && el.contains(range.endContainer);
 }
 
-function pasteIntoRichEditor(el: HTMLElement, text: string): boolean {
+function escapeHtml(text: string): string {
+  return text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+function buildProseMirrorHtml(text: string): string {
+  const lines = text.split('\n');
+  const parts = new Array<string>(lines.length);
+  for (let i = 0; i < lines.length; i += 1) {
+    parts[i] = `<p>${escapeHtml(lines[i]!)}</p>`;
+  }
+  return `<div data-pm-slice="1 1 []">${parts.join('')}</div>`;
+}
+
+function isLegacyQuill1(el: HTMLElement): boolean {
+  return (
+    el.classList.contains('ql-editor') && Boolean(el.parentElement?.querySelector('.ql-clipboard'))
+  );
+}
+
+function pasteIntoRichEditor(
+  el: HTMLElement,
+  selection: Selection,
+  text: string,
+  includeProseMirrorHtml: boolean,
+): boolean {
+  const savedRange = selection.rangeCount ? selection.getRangeAt(0).cloneRange() : null;
   const data = new DataTransfer();
   data.setData('text/plain', text);
-  const wrapper = document.createElement('div');
-  // An open ProseMirror slice joins the first and last lines to the surrounding
-  // paragraph and preserves empty paragraphs and indentation between them.
-  wrapper.dataset.pmSlice = '1 1 []';
-  for (const line of text.split('\n')) {
-    const paragraph = document.createElement('p');
-    paragraph.textContent = line;
-    wrapper.appendChild(paragraph);
+  if (includeProseMirrorHtml) {
+    // An open ProseMirror slice joins the first and last lines to the surrounding
+    // paragraph and preserves empty paragraphs and indentation between them.
+    // Build markup only from the chosen text. Source HTML may contain hidden originals.
+    data.setData('text/html', buildProseMirrorHtml(text));
   }
-  // Build markup only from the chosen text. Source HTML may contain hidden originals.
-  data.setData('text/html', wrapper.outerHTML);
-  return !el.dispatchEvent(
+  const handled = !el.dispatchEvent(
     new ClipboardEvent('paste', {
       bubbles: true,
       composed: true,
@@ -57,15 +77,28 @@ function pasteIntoRichEditor(el: HTMLElement, text: string): boolean {
       clipboardData: data,
     }),
   );
+  if (!handled && savedRange) {
+    const current = selection.rangeCount ? selection.getRangeAt(0) : null;
+    if (!current || !within(el, current)) {
+      el.focus();
+      if (within(el, savedRange)) {
+        selection.removeAllRanges();
+        selection.addRange(savedRange);
+      }
+    }
+  }
+  return handled;
 }
 
 function insertTextAtCaret(el: HTMLElement, selection: Selection, text: string): boolean {
   if (!selection.rangeCount) return false;
   const range = selection.getRangeAt(0);
   if (!within(el, range)) return false;
+  const beforeText = text ? el.textContent : null;
   const inputOptions = { bubbles: true, composed: true, inputType: 'insertText', data: text };
   if (!el.dispatchEvent(new InputEvent('beforeinput', { ...inputOptions, cancelable: true }))) {
-    return false;
+    // 若富文本框架（如 Slate / Lexical）在 beforeinput 中自行接管并写入了内容，视为回填成功
+    return Boolean(text && el.textContent !== beforeText);
   }
   if (!within(el, range)) return false;
   range.deleteContents();
@@ -88,13 +121,26 @@ function insertTextAtCaret(el: HTMLElement, selection: Selection, text: string):
   return true;
 }
 
-const RICH_TEXT_BATCH_SIZE = 4 * 1024;
-const MIN_BATCH_SIZE = 256;
-const MAX_BATCH_LINES = 32;
-const MIN_BATCH_LINES = 4;
-const BATCH_BUDGET_MS = 8;
+// 富文本编辑器直接回填上限：超过后直接走“复制脱敏结果 + 二次粘贴原生放行”，
+// 避免在 contenteditable（尤其 Gemini 的 Quill 1）里循环注入大量 DOM 节点导致 O(N²) 假死，
+// 同时保留站点原生的“超长粘贴转附件”能力。
+const RICH_DIRECT_MAX_SIZE = 128 * 1024;
+const RICH_DIRECT_MAX_LINES = 2000;
+const QUILL1_DIRECT_MAX_SIZE = 32 * 1024;
+const QUILL1_DIRECT_MAX_LINES = 500;
 
-function batchEnd(text: string, offset: number, size: number, maxLines = MAX_BATCH_LINES): number {
+const CARET_BATCH_SIZE = 16 * 1024;
+const CARET_MIN_BATCH_SIZE = 4 * 1024;
+const CARET_BATCH_LINES = 400;
+const CARET_MIN_BATCH_LINES = 64;
+const CARET_BATCH_BUDGET_MS = 24;
+// 兜底熔断：分批回填累计超时即中止并复制剩余文本，杜绝页面无响应。
+const MAX_BATCH_TOTAL_MS = 1500;
+
+export type InsertOutcome =
+  { status: 'inserted' } | { status: 'too-large' } | { status: 'incomplete'; offset: number };
+
+function batchEnd(text: string, offset: number, size: number, maxLines: number): number {
   let end = Math.min(offset + size, text.length);
   const batch = text.slice(offset, end);
   let newline = batch.indexOf('\n');
@@ -121,10 +167,11 @@ async function insertRichText(
   text: string,
   insertBatch: (text: string) => boolean,
   canContinue: () => boolean,
-): Promise<number | null> {
+): Promise<InsertOutcome> {
+  const startedAt = performance.now();
   let offset = 0;
-  let size = RICH_TEXT_BATCH_SIZE;
-  let lines = MAX_BATCH_LINES;
+  let size = CARET_BATCH_SIZE;
+  let lines = CARET_BATCH_LINES;
   let fastBatches = 0;
   let interrupted = false;
   const controller = new AbortController();
@@ -142,58 +189,64 @@ async function insertRichText(
     selection.rangeCount > 0 &&
     within(el, selection.getRangeAt(0));
   try {
-    do {
+    while (offset < text.length) {
       const end = batchEnd(text, offset, size, lines);
       const start = performance.now();
-      if (!insertBatch(text.slice(offset, end))) return offset;
+      if (!insertBatch(text.slice(offset, end))) return { status: 'incomplete', offset };
       offset = end;
-      if (offset === text.length) return null;
+      if (offset === text.length) return { status: 'inserted' };
 
       // Allow editor mutation observers to reconcile the DOM and caret first.
       await Promise.resolve();
-      const elapsed = performance.now() - start;
-      if (elapsed > BATCH_BUDGET_MS) {
-        size = Math.max(MIN_BATCH_SIZE, Math.floor(size / 2));
-        lines = Math.max(MIN_BATCH_LINES, Math.floor(lines / 2));
+      const now = performance.now();
+      if (now - startedAt >= MAX_BATCH_TOTAL_MS) return { status: 'incomplete', offset };
+      const elapsed = now - start;
+      if (elapsed > CARET_BATCH_BUDGET_MS) {
+        size = Math.max(CARET_MIN_BATCH_SIZE, Math.floor(size / 2));
+        lines = Math.max(CARET_MIN_BATCH_LINES, Math.floor(lines / 2));
         fastBatches = 0;
-      } else if (elapsed < BATCH_BUDGET_MS / 2) {
+      } else if (elapsed < CARET_BATCH_BUDGET_MS / 2) {
         fastBatches += 1;
         if (fastBatches === 3) {
-          size = Math.min(RICH_TEXT_BATCH_SIZE, size * 2);
-          lines = Math.min(MAX_BATCH_LINES, lines * 2);
+          size = Math.min(CARET_BATCH_SIZE, size * 2);
+          lines = Math.min(CARET_BATCH_LINES, lines * 2);
           fastBatches = 0;
         }
       } else {
         fastBatches = 0;
       }
-      if (!canResume()) return offset;
+      if (!canResume()) return { status: 'incomplete', offset };
       const caret = selection.getRangeAt(0).cloneRange();
-      // Yield to rendering and input before the next native edit.
-      await new Promise<void>((resolve) => setTimeout(resolve, 16));
+      // Yield to rendering and input before the next edit without artificial 16ms sleep.
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
       if (
+        performance.now() - startedAt >= MAX_BATCH_TOTAL_MS ||
         !canResume() ||
         caret.compareBoundaryPoints(Range.START_TO_START, selection.getRangeAt(0)) !== 0
       )
-        return offset;
-    } while (offset < text.length);
+        return { status: 'incomplete', offset };
+    }
   } catch {
-    return offset;
+    return { status: 'incomplete', offset };
   } finally {
     controller.abort();
   }
-  return null;
+  return { status: 'inserted' };
 }
 
 /** Capture the paste destination before the preview moves focus. */
 export function captureInsertion(el: HTMLElement, event: Event) {
   const field = isField(el) ? el : null;
   const value = field?.value;
+  const hasSelectionRange = field != null && field.selectionStart != null;
   const start = field?.selectionStart ?? value?.length ?? 0;
   const end = field?.selectionEnd ?? start;
   const selection = window.getSelection();
   const selected = selection?.rangeCount ? selection.getRangeAt(0) : null;
   const drop =
-    event instanceof DragEvent ? document.caretRangeFromPoint(event.clientX, event.clientY) : null;
+    event instanceof DragEvent && typeof document.caretRangeFromPoint === 'function'
+      ? document.caretRangeFromPoint(event.clientX, event.clientY)
+      : null;
   const range =
     drop && within(el, drop)
       ? drop
@@ -223,21 +276,38 @@ export function captureInsertion(el: HTMLElement, event: Event) {
       return { undo, dispose: () => controller.abort() };
     },
     /** Return the start of the uninserted text, or null on completion. */
-    async insert(text: string, isCurrent: () => boolean): Promise<number | null> {
+    async insert(text: string, isCurrent: () => boolean): Promise<InsertOutcome> {
       const canContinue = () =>
         isCurrent() && !edited && el.isConnected && getEditableTarget(el) === el;
-      if (!canContinue()) return 0;
+      if (!canContinue()) return { status: 'incomplete', offset: 0 };
       if (field) {
-        if (field.value !== value) return 0;
+        if (field.value !== value) return { status: 'incomplete', offset: 0 };
         field.focus();
-        if (document.activeElement !== field && field.getRootNode() instanceof Document) return 0;
-        if (field.value !== value) return 0;
+        if (document.activeElement !== field && field.getRootNode() instanceof Document)
+          return { status: 'incomplete', offset: 0 };
+        if (field.value !== value) return { status: 'incomplete', offset: 0 };
         const previous = field.value;
-        writeField(
-          field,
-          previous.slice(0, start) + text + previous.slice(end),
-          start + text.length,
-        );
+        writing = true;
+        try {
+          // input[type=email] 等不支持 selectionStart 的控件优先尝试 execCommand 保留选区替换语义
+          if (!hasSelectionRange) {
+            const singleLine = text.replace(/[\r\n]+/g, '');
+            if (
+              !document.execCommand('insertText', false, singleLine) ||
+              field.value === previous
+            ) {
+              writeField(field, singleLine, singleLine.length);
+            }
+          } else {
+            writeField(
+              field,
+              previous.slice(0, start) + text + previous.slice(end),
+              start + text.length,
+            );
+          }
+        } finally {
+          writing = false;
+        }
         const inserted = field.value;
         edited = false;
         undoField = () => {
@@ -251,37 +321,68 @@ export function captureInsertion(el: HTMLElement, event: Event) {
           field.focus();
           if (field.value === inserted) writeField(field, previous, start);
         };
-        return null;
+        return { status: 'inserted' };
       }
-      if (!selection) return 0;
+      if (!selection) return { status: 'incomplete', offset: 0 };
       el.focus();
-      if (!canContinue() || !el.matches(':focus-within')) return 0;
+      if (!canContinue() || !el.matches(':focus-within'))
+        return { status: 'incomplete', offset: 0 };
       const caret = range ?? document.createRange();
-      if (range && !within(el, range)) return 0;
+      if (range && !within(el, range)) return { status: 'incomplete', offset: 0 };
       if (!range) {
         caret.selectNodeContents(el);
         caret.collapse(false);
       }
       selection.removeAllRanges();
       selection.addRange(caret);
-      const batched = batchEnd(text, 0, RICH_TEXT_BATCH_SIZE) < text.length;
-      const preserveWhitespace = batched || /[\r\n\t]| {2}|^ | $/.test(text);
-      const insertBatch = (batch: string) => {
+
+      const legacyQuill1 = isLegacyQuill1(el);
+      const maxSize = legacyQuill1 ? QUILL1_DIRECT_MAX_SIZE : RICH_DIRECT_MAX_SIZE;
+      const maxLines = legacyQuill1 ? QUILL1_DIRECT_MAX_LINES : RICH_DIRECT_MAX_LINES;
+      if (batchEnd(text, 0, maxSize, maxLines) < text.length) {
+        return { status: 'too-large' };
+      }
+
+      const isProseMirror = el.classList.contains('ProseMirror');
+      const needsCaretBatch = batchEnd(text, 0, CARET_BATCH_SIZE, CARET_BATCH_LINES) < text.length;
+      const preserveWhitespace = needsCaretBatch || /[\r\n\t]| {2}|^ | $/.test(text);
+
+      // Fast path 1: short single-line plain text via native execCommand (preserves browser undo).
+      if (!preserveWhitespace) {
         writing = true;
         try {
-          if (!preserveWhitespace && document.execCommand('insertText', false, batch)) return true;
-          const normalized = batch.replace(/\r\n?/g, '\n');
-          if (el.classList.contains('ProseMirror') && pasteIntoRichEditor(el, normalized))
-            return true;
-          return insertTextAtCaret(el, selection, normalized);
+          if (document.execCommand('insertText', false, text)) return { status: 'inserted' };
+        } finally {
+          writing = false;
+        }
+      }
+
+      // Fast path 2: single-shot synthetic paste handled natively by modern rich editors
+      // (ProseMirror, Lexical, Slate, Quill 2, CodeMirror, CKEditor, etc.).
+      if (!legacyQuill1) {
+        writing = true;
+        try {
+          if (pasteIntoRichEditor(el, selection, text.replace(/\r\n?/g, '\n'), isProseMirror)) {
+            return { status: 'inserted' };
+          }
+        } finally {
+          writing = false;
+        }
+      }
+
+      // Fallback path: direct DOM insertion at caret (batched with a hard time cap).
+      const insertCaretBatch = (batch: string) => {
+        writing = true;
+        try {
+          return insertTextAtCaret(el, selection, batch.replace(/\r\n?/g, '\n'));
         } finally {
           writing = false;
         }
       };
-      if (batched) {
-        return insertRichText(el, selection, text, insertBatch, canContinue);
+      if (needsCaretBatch) {
+        return insertRichText(el, selection, text, insertCaretBatch, canContinue);
       }
-      return insertBatch(text) ? null : 0;
+      return insertCaretBatch(text) ? { status: 'inserted' } : { status: 'incomplete', offset: 0 };
     },
   };
 }

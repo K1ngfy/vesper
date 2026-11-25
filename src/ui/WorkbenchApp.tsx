@@ -17,12 +17,15 @@ import {
   LAST_MAPPING_KEY,
   MAPPING_HISTORY_KEY,
   type MappingRecord,
+  type Settings,
 } from '../storage';
 import { t } from '../i18n';
 import { startEngineJob } from '../core/worker-job';
+import VesperLogo from './VesperLogo';
 
 const WORKER_THRESHOLD = 12 * 1024;
 const HIGHLIGHT_LIMIT = 500;
+const DISPLAY_CHAR_LIMIT = 256 * 1024;
 const MAX_FILE_SIZE = 10 * 1024 * 1024; // 10MB
 const FILE_EXTS = ['.txt', '.log', '.md', '.json', '.csv'];
 
@@ -44,6 +47,7 @@ export default function WorkbenchApp() {
 
   const [lastMapping, setLastMapping] = useState<Record<string, string>>({});
   const mappingRevision = useRef(0);
+  const noticeTimer = useRef<number | null>(null);
 
   const resultRef = useRef<HTMLDivElement>(null);
 
@@ -54,17 +58,73 @@ export default function WorkbenchApp() {
 
   const res =
     completed && completed.input === input && completed.scheme === scheme ? completed.result : null;
+  const pending = Boolean(input && scheme && !res);
+  const displayRes = input ? (res ?? completed?.result ?? null) : null;
 
-  // 订阅先于读取，防止启动时较旧的读取结果覆盖网页刚写入的最新映射。
+  function showNotice(message: string, durationMs = 0) {
+    if (noticeTimer.current != null) {
+      window.clearTimeout(noticeTimer.current);
+      noticeTimer.current = null;
+    }
+    setNotice(message);
+    if (durationMs > 0) {
+      noticeTimer.current = window.setTimeout(() => {
+        noticeTimer.current = null;
+        setNotice('');
+      }, durationMs);
+    }
+  }
+
+  useEffect(() => {
+    return () => {
+      if (noticeTimer.current != null) window.clearTimeout(noticeTimer.current);
+    };
+  }, []);
+
+  // 订阅先于读取，防止启动时较旧的读取结果覆盖网页刚写入的最新映射；同时实时同步方案与设置变更。
   useEffect(() => {
     const onChange = (changes: Record<string, chrome.storage.StorageChange>, area: string) => {
-      const change = changes[LAST_MAPPING_KEY];
-      const history = changes[MAPPING_HISTORY_KEY];
-      if (area === 'local' && history && history.newValue === undefined) {
-        mappingRevision.current += 1;
-        setLastMapping({});
+      if (area === 'local') {
+        const history = changes[MAPPING_HISTORY_KEY];
+        if (history && history.newValue === undefined) {
+          const rev = ++mappingRevision.current;
+          void getLatestMapping()
+            .then((record) => {
+              if (rev === mappingRevision.current) setLastMapping(record?.mapping ?? {});
+            })
+            .catch(() => {});
+        }
+        const schemesChange = changes['vesper:schemes'];
+        if (schemesChange && Array.isArray(schemesChange.newValue)) {
+          const nextList = schemesChange.newValue as Scheme[];
+          setSchemes(nextList);
+          setSchemeId((current) =>
+            nextList.some((s) => s.id === current)
+              ? current
+              : (nextList.find((s) => s.isDefault)?.id ?? nextList[0]?.id ?? ''),
+          );
+        }
+        const settingsChange = changes['vesper:settings'];
+        if (settingsChange?.newValue) {
+          const prevActive = (settingsChange.oldValue as Settings | undefined)?.activeSchemeId;
+          const nextActive = (settingsChange.newValue as Settings).activeSchemeId;
+          if (nextActive && nextActive !== prevActive) setSchemeId(nextActive);
+        }
+        return;
       }
-      if (area !== 'session' || !change) return;
+      if (area !== 'session') return;
+      const pendingChange = changes['vesper:pendingInput'];
+      if (
+        typeof pendingChange?.newValue === 'string' &&
+        pendingChange.newValue &&
+        location.pathname.endsWith('/workbench.html')
+      ) {
+        setMode('desensitize');
+        setInput(pendingChange.newValue);
+        void chrome.storage.session.remove('vesper:pendingInput').catch(() => {});
+      }
+      const change = changes[LAST_MAPPING_KEY];
+      if (!change) return;
       mappingRevision.current += 1;
       setLastMapping((change.newValue as MappingRecord | undefined)?.mapping ?? {});
     };
@@ -98,7 +158,19 @@ export default function WorkbenchApp() {
   }, []);
 
   useEffect(() => {
-    if (!scheme || !input) return;
+    if (!scheme || !input) {
+      if (!input) showNotice('');
+      return;
+    }
+    if (!scheme.enabled) {
+      setCompleted({
+        input,
+        scheme,
+        result: { output: input, hits: [], mapping: {}, durationMs: 0 },
+      });
+      showNotice(t.workbench.schemeDisabledHint);
+      return;
+    }
     let cancelled = false;
     let job: ReturnType<typeof startEngineJob> | undefined;
     const timer = setTimeout(async () => {
@@ -110,6 +182,7 @@ export default function WorkbenchApp() {
         const result = job ? await job.result : desensitize(input, scheme, true);
         if (cancelled) return;
         setCompleted({ input, scheme, result });
+        showNotice('');
         if (result.hits.length > 0) {
           mappingRevision.current += 1;
           setLastMapping(result.mapping);
@@ -120,7 +193,7 @@ export default function WorkbenchApp() {
           }).catch(() => {});
         }
       } catch {
-        if (!cancelled) setNotice('脱敏未完成，请检查规则或缩短文本后重试。');
+        if (!cancelled) showNotice('脱敏未完成，请检查规则或缩短文本后重试。');
       }
     }, 150);
     return () => {
@@ -144,43 +217,42 @@ export default function WorkbenchApp() {
   async function copyText(text: string) {
     try {
       await navigator.clipboard.writeText(text);
-      setNotice(t.common.copied);
-      setTimeout(() => setNotice(''), 1500);
+      showNotice(t.common.copied, 1500);
     } catch {
-      setNotice('复制失败');
+      showNotice('复制失败', 2000);
     }
   }
 
   function importFile(file: File) {
     const okExt = FILE_EXTS.some((ext) => file.name.toLowerCase().endsWith(ext));
     if (!okExt) {
-      setNotice(t.workbench.fileTypeUnsupported);
+      showNotice(t.workbench.fileTypeUnsupported);
       return;
     }
     if (file.size > MAX_FILE_SIZE) {
-      setNotice(t.workbench.fileTooLarge);
+      showNotice(t.workbench.fileTooLarge);
       return;
     }
     const reader = new FileReader();
     reader.onload = () => setInput(String(reader.result ?? ''));
-    reader.onerror = () => setNotice('读取文件失败');
+    reader.onerror = () => showNotice('读取文件失败');
     reader.readAsText(file);
   }
 
   /** 命中清单聚合：规则名 × 次数，点击定位到首个高亮 */
   const hitGroups = useMemo(() => {
     const map = new Map<string, { id: string; name: string; count: number }>();
-    for (const h of res?.hits ?? []) {
+    for (const h of displayRes?.hits ?? []) {
       const g = map.get(h.ruleId) ?? { id: h.ruleId, name: h.ruleName, count: 0 };
       g.count += 1;
       map.set(h.ruleId, g);
     }
     return [...map.values()];
-  }, [res]);
+  }, [displayRes]);
 
   const highlightedRuleIds = useMemo(
-    () => new Set(res?.hits.slice(0, HIGHLIGHT_LIMIT).map((hit) => hit.ruleId)),
-    [res],
+    () => new Set(displayRes?.hits.slice(0, HIGHLIGHT_LIMIT).map((hit) => hit.ruleId)),
+    [displayRes],
   );
 
   function locateHit(ruleId: string) {
@@ -188,13 +260,18 @@ export default function WorkbenchApp() {
     el?.scrollIntoView({ behavior: 'smooth', block: 'center' });
   }
 
-  /** 结果区渲染：按 hit.index 高亮被替换片段，悬停显示原值与规则名 */
+  /** 结果区渲染：按 hit.index 高亮被替换片段，悬停显示原值与规则名；超大文本截断 DOM 预览防卡顿 */
   const highlighted = useMemo(() => {
-    if (!res) return null;
+    if (!displayRes) return null;
+    const truncated = displayRes.output.length > DISPLAY_CHAR_LIMIT;
+    const maxEnd = truncated ? DISPLAY_CHAR_LIMIT : displayRes.output.length;
     const parts: React.ReactNode[] = [];
     let cursor = 0;
-    res.hits.slice(0, HIGHLIGHT_LIMIT).forEach((h, i) => {
-      if (h.index > cursor) parts.push(res.output.slice(cursor, h.index));
+    const visibleHits = displayRes.hits.slice(0, HIGHLIGHT_LIMIT);
+    for (let i = 0; i < visibleHits.length; i += 1) {
+      const h = visibleHits[i]!;
+      if (h.index >= maxEnd) break;
+      if (h.index > cursor) parts.push(displayRes.output.slice(cursor, h.index));
       parts.push(
         <mark
           key={i}
@@ -206,18 +283,30 @@ export default function WorkbenchApp() {
         </mark>,
       );
       cursor = h.index + h.replaced.length;
-    });
-    parts.push(res.output.slice(cursor));
+    }
+    if (cursor < maxEnd) parts.push(displayRes.output.slice(cursor, maxEnd));
+    if (truncated) {
+      parts.push(
+        <div key="truncated" className="mt-2 text-xs text-[var(--vesper-text-dim)]">
+          {t.workbench.previewTruncated(DISPLAY_CHAR_LIMIT / 1024)}
+        </div>,
+      );
+    }
     return parts;
-  }, [res]);
+  }, [displayRes]);
 
   /** 还原模式渲染：按 mark.index 高亮被还原片段（原占位符位置 → 现原值），悬停显示占位符 */
   const restoredHighlighted = useMemo(() => {
     const { output, marks } = restoreResult;
-    if (marks.length === 0) return output;
+    const truncated = output.length > DISPLAY_CHAR_LIMIT;
+    const maxEnd = truncated ? DISPLAY_CHAR_LIMIT : output.length;
+    if (marks.length === 0 && !truncated) return output;
     const parts: React.ReactNode[] = [];
     let cursor = 0;
-    marks.slice(0, HIGHLIGHT_LIMIT).forEach((mk, i) => {
+    const visibleMarks = marks.slice(0, HIGHLIGHT_LIMIT);
+    for (let i = 0; i < visibleMarks.length; i += 1) {
+      const mk = visibleMarks[i]!;
+      if (mk.index >= maxEnd) break;
       if (mk.index > cursor) parts.push(output.slice(cursor, mk.index));
       parts.push(
         <mark key={i} className="vesper-mark" title={`${mk.placeholder} → ${mk.original}`}>
@@ -225,8 +314,15 @@ export default function WorkbenchApp() {
         </mark>,
       );
       cursor = mk.index + mk.length;
-    });
-    parts.push(output.slice(cursor));
+    }
+    if (cursor < maxEnd) parts.push(output.slice(cursor, maxEnd));
+    if (truncated) {
+      parts.push(
+        <div key="truncated" className="mt-2 text-xs text-[var(--vesper-text-dim)]">
+          {t.workbench.previewTruncated(DISPLAY_CHAR_LIMIT / 1024)}
+        </div>,
+      );
+    }
     return parts;
   }, [restoreResult]);
 
@@ -236,8 +332,9 @@ export default function WorkbenchApp() {
     <div className="flex h-screen flex-col">
       {/* 顶部：品牌 + 方案选择 + 模式切换 */}
       <header className="flex items-center gap-4 border-b border-[var(--vesper-border)] px-4 py-3">
-        <span className="text-lg font-bold">
-          <span style={{ color: 'var(--vesper-accent)' }}>✳</span> VESPER
+        <span className="inline-flex items-center gap-1.5 text-lg font-bold">
+          <VesperLogo size={22} />
+          <span>{t.appName}</span>
         </span>
         <select
           className="rounded-md border border-[var(--vesper-border)] bg-[#ffffff] px-2 py-1 text-sm"
@@ -251,6 +348,7 @@ export default function WorkbenchApp() {
             <option key={s.id} value={s.id}>
               {s.name}
               {s.isDefault ? `（${t.common.defaultTag}）` : ''}
+              {!s.enabled ? `（${t.common.disabled}）` : ''}
             </option>
           ))}
         </select>
@@ -279,7 +377,11 @@ export default function WorkbenchApp() {
               e.preventDefault();
               setDragOver(true);
             }}
-            onDragLeave={() => setDragOver(false)}
+            onDragLeave={(e) => {
+              if (!e.currentTarget.contains(e.relatedTarget as Node | null)) {
+                setDragOver(false);
+              }
+            }}
             onDrop={(e) => {
               e.preventDefault();
               setDragOver(false);
@@ -321,8 +423,9 @@ export default function WorkbenchApp() {
           <div className="flex w-1/2 min-w-0 flex-col">
             <div className="flex items-center gap-2 px-3 py-2 text-xs text-[var(--vesper-text-dim)]">
               <span>{t.workbench.result}</span>
+              {pending && <span>{t.workbench.processing}</span>}
               <button
-                className="ml-auto rounded border border-[var(--vesper-border)] px-2 py-0.5 hover:border-[var(--vesper-accent)]"
+                className="ml-auto rounded border border-[var(--vesper-border)] px-2 py-0.5 hover:border-[var(--vesper-accent)] disabled:opacity-50"
                 disabled={!res}
                 onClick={() => res && copyText(res.output)}
               >
@@ -331,7 +434,9 @@ export default function WorkbenchApp() {
             </div>
             <div
               ref={resultRef}
-              className="min-h-0 flex-1 overflow-auto whitespace-pre-wrap break-all p-3 font-mono text-sm"
+              className={`min-h-0 flex-1 overflow-auto whitespace-pre-wrap break-all p-3 font-mono text-sm transition-opacity ${
+                pending ? 'opacity-60' : ''
+              }`}
             >
               {highlighted}
             </div>
@@ -397,15 +502,28 @@ export default function WorkbenchApp() {
 
       {/* 底部状态条 */}
       <footer className="flex items-center gap-4 border-t border-[var(--vesper-border)] px-4 py-1.5 text-xs text-[var(--vesper-text-dim)]">
-        <span>
-          {t.workbench.chars} {input.length}
-        </span>
-        <span>
-          {t.workbench.hits} {res?.hits.length ?? 0}
-        </span>
-        <span>
-          {t.workbench.duration} {res?.durationMs ?? 0}ms
-        </span>
+        {mode === 'desensitize' ? (
+          <>
+            <span>
+              {t.workbench.chars} {input.length}
+            </span>
+            <span>
+              {t.workbench.hits} {res?.hits.length ?? 0}
+            </span>
+            <span>
+              {t.workbench.duration} {res?.durationMs ?? 0}ms
+            </span>
+          </>
+        ) : (
+          <>
+            <span>
+              {t.workbench.chars} {restoreInput.length}
+            </span>
+            <span>
+              {t.workbench.restoredHits} {restoreResult.marks.length}
+            </span>
+          </>
+        )}
         <span className="ml-auto text-[var(--vesper-accent)]">{notice}</span>
       </footer>
     </div>

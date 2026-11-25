@@ -11,6 +11,7 @@
  *   textContent 构建。
  */
 import type { DesensitizeResult } from '../core/types';
+import { createVesperLogoSvg } from '../brand';
 import { t } from '../i18n';
 
 const HOST_ID = 'vesper-shadow-host';
@@ -60,8 +61,9 @@ const BASE_STYLE = `
   }
   @keyframes spin { to { transform: rotate(360deg); } }
   @media (prefers-reduced-motion: reduce) { .spinner { animation: none; } }
-  .title { flex: none; font-size: 16px; font-weight: 600; margin-bottom: 4px; }
-  .title .hint { font-size: 12px; color: #6b7280; font-weight: 400; margin-left: 6px; }
+  .title { flex: none; display: flex; align-items: center; gap: 6px; flex-wrap: wrap; font-size: 16px; font-weight: 600; margin-bottom: 4px; }
+  .title .hint { font-size: 12px; color: #6b7280; font-weight: 400; margin-left: 2px; }
+  .toast-msg { display: inline-flex; align-items: center; gap: 6px; }
   .rows { min-height: 0; overflow-y: auto; overscroll-behavior: contain; margin: 12px 0; }
   .footer { flex: none; display: grid; gap: 12px; border-top: 1px solid #e5e5e5; padding-top: 12px; }
   .more { color: #6b7280; font-size: 12px; }
@@ -128,12 +130,14 @@ export function showPreview(res: DesensitizeResult, actions: PreviewActions): vo
   dialog.className = 'panel dialog preview';
   dialog.setAttribute('aria-label', t.content.previewTitle);
 
+  const totalHits = res.hitCount ?? res.hits.length;
   const title = document.createElement('div');
   title.className = 'title';
-  title.appendChild(document.createTextNode(`✳ ${t.content.previewTitle}`));
+  title.appendChild(createVesperLogoSvg(18));
+  title.appendChild(document.createTextNode(t.content.previewTitle));
   const hint = document.createElement('span');
   hint.className = 'hint';
-  hint.textContent = t.content.previewHint(res.hits.length);
+  hint.textContent = t.content.previewHint(totalHits);
   title.appendChild(hint);
   dialog.appendChild(title);
 
@@ -167,10 +171,10 @@ export function showPreview(res: DesensitizeResult, actions: PreviewActions): vo
 
   const footer = document.createElement('div');
   footer.className = 'footer';
-  if (res.hits.length > 50) {
+  if (totalHits > 50) {
     const more = document.createElement('div');
     more.className = 'more';
-    more.textContent = `… 共 ${res.hits.length} 处，仅展示前 50 条`;
+    more.textContent = `… 共 ${totalHits} 处，仅展示前 50 条`;
     footer.appendChild(more);
   }
 
@@ -237,8 +241,9 @@ export function showToast(message: string, actions: ToastActions = {}): () => vo
   toast.className = 'panel toast';
 
   const text = document.createElement('span');
+  text.className = 'toast-msg';
   text.setAttribute('role', 'status');
-  text.textContent = `✳ ${message}`;
+  text.append(createVesperLogoSvg(16), document.createTextNode(message));
   toast.appendChild(text);
 
   if (actions.onUndo) {
@@ -269,5 +274,5 @@ export function showToast(message: string, actions: ToastActions = {}): () => vo
 
 /** 判断事件目标是否在 VESPER 自身 UI 内（护栏） */
 export function isOwnUI(el: EventTarget | null): boolean {
-  return el === root?.host;
+  return el === root?.host || (el instanceof Node && Boolean(root?.contains(el)));
 }

@@ -5,6 +5,7 @@ import { useState } from 'react';
 import SchemesTab from '@/src/ui/options/SchemesTab';
 import SitesTab from '@/src/ui/options/SitesTab';
 import SettingsTab from '@/src/ui/options/SettingsTab';
+import VesperLogo from '@/src/ui/VesperLogo';
 import { t } from '@/src/i18n';
 
 type Tab = 'schemes' | 'sites' | 'settings';
@@ -20,8 +21,9 @@ export default function App() {
   return (
     <div className="mx-auto min-h-screen max-w-7xl p-6">
       <header className="mb-6 flex items-center gap-3">
-        <span className="text-2xl font-bold">
-          <span style={{ color: 'var(--vesper-accent)' }}>✳</span> {t.appName}
+        <span className="inline-flex items-center gap-2 text-2xl font-bold">
+          <VesperLogo size={28} />
+          <span>{t.appName}</span>
         </span>
         <span className="text-xs text-[var(--vesper-text-dim)]">{t.slogan}</span>
       </header>

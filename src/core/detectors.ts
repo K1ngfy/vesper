@@ -29,9 +29,11 @@ export const DETECTORS: Record<BuiltinDetectorId, Detector> = {
   phone_cn: {
     id: 'phone_cn',
     name: '中国手机号',
-    description: '1 开头的 11 位手机号，支持空格/连字符分隔',
+    description: '1 开头的 11 位手机号，支持 +86 前缀及空格/连字符分隔',
     // 前后断言防止误匹配更长数字串（如 18 位身份证号）的片段
-    patterns: [{ source: '(?<!\\d)1[3-9]\\d[\\s-]?\\d{4}[\\s-]?\\d{4}(?!\\d)', flags: 'g' }],
+    patterns: [
+      { source: '(?<!\\d)(?:\\+86[\\s-]?)?1[3-9]\\d[\\s-]?\\d{4}[\\s-]?\\d{4}(?!\\d)', flags: 'g' },
+    ],
     defaultReplacement: '[PHONE_n]',
   },
 
@@ -118,15 +120,22 @@ export const DETECTORS: Record<BuiltinDetectorId, Detector> = {
     name: '连接串密码',
     description: 'password=... 与 ://user:pass@host 中的密码段（仅替换密码）',
     patterns: [
-      // key=value 形式：仅替换值（第 3 组），保留键与引号
+      // 无引号 key=value / "password": value 形式：仅替换值（第 2 组）
       {
-        source: '(password\\s*[=:]\\s*)([\'"]?)([^\\s\'";\\uE000\\uE001]+)\\2',
+        source: '(password[\'"]?\\s*[=:]\\s*)([^\\s\'",;}\\]\\uE000-\\uE019]+)',
+        flags: 'gi',
+        group: 2,
+      },
+      // 带引号 key="value" / "password": "value" 形式：允许值内含分号、逗号、空格（第 3 组）
+      {
+        source:
+          '(password[\'"]?\\s*[=:]\\s*)([\'"])((?:\\\\.|(?!\\2)[^\\r\\n\\uE000-\\uE019])+)\\2',
         flags: 'gi',
         group: 3,
       },
-      // URL 形式：仅替换 user:pass@ 中的 pass（第 2 组）
+      // URL 形式：仅替换 user:pass@ 中的 pass（第 2 组）；排除 / 避免带端口 URL 路径含 @ 误报
       {
-        source: '(://[^:\\s/@]+:)([^@\\s\\uE000\\uE001]+)(@)',
+        source: '(://[^:\\s/@]+:)([^@/\\s\\uE000-\\uE019]+)(@)',
         flags: 'g',
         group: 2,
       },
@@ -140,7 +149,7 @@ export const DETECTORS: Record<BuiltinDetectorId, Detector> = {
     description: 'Authorization: Bearer ... 的 token 段（仅替换 token）',
     patterns: [
       {
-        source: '(Authorization\\s*:\\s*Bearer\\s+)([A-Za-z0-9._~+/=\\-]+)',
+        source: '(Authorization[\'"]?\\s*:\\s*[\'"]?Bearer\\s+)([A-Za-z0-9._~+/=\\-]+)',
         flags: 'gi',
         group: 2,
       },
@@ -157,9 +166,15 @@ export const DETECTORS: Record<BuiltinDetectorId, Detector> = {
     patterns: [
       {
         source:
-          '\\b(api[_-]?key|secret|token|passwd|password|pwd)\\b(\\s*[:=]\\s*)([\'"]?)([^\\s\'",;\\uE000\\uE001]+)\\3',
+          '\\b(api[_-]?key|secret|token|passwd|password|pwd)\\b([\'"]?\\s*[:=]\\s*)([\'"])((?:\\\\.|(?!\\3)[^\\r\\n\\uE000-\\uE019])+)\\3',
         flags: 'gi',
         group: 4,
+      },
+      {
+        source:
+          '\\b(api[_-]?key|secret|token|passwd|password|pwd)\\b([\'"]?\\s*[:=]\\s*)([^\\s\'",;}\\]\\uE000-\\uE019]+)',
+        flags: 'gi',
+        group: 3,
       },
     ],
     defaultReplacement: '[SECRET_n]',

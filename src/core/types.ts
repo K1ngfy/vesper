@@ -46,6 +46,8 @@ export interface Hit {
 export interface DesensitizeResult {
   output: string;
   hits: Hit[];
+  /** 总命中数（当跨进程回传仅保留前 50 条预览命中时，用于准确展示总计数） */
+  hitCount?: number;
   /** 占位符 → 原值；仅 numbered/fixed 且可逆的规则产生；mask 不可逆（文档 4.7） */
   mapping: Record<string, string>;
   durationMs: number;

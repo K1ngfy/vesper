@@ -16,29 +16,23 @@ import {
 import type { Scheme, SiteCategory, SiteMode, SiteRule, SiteScope } from '../../core/types';
 import { sendMessage } from '../../messages';
 import {
+  getRemovableOrigins,
   getSchemes,
   getSites,
   saveSites,
   getSettings,
   updateSettings,
   hostToOrigins,
+  isValidHostPattern,
 } from '../../storage';
 import { t } from '../../i18n';
 import Toggle from '../Toggle';
 
-/** 域名/通配模式校验：接受 example.com、*.example.com、*；拒绝含协议/路径的输入 */
-function isValidHostPattern(input: string): boolean {
-  const v = input.trim().toLowerCase();
-  if (v === '*') return true;
-  const base = v.startsWith('*.') ? v.slice(2) : v;
-  if (!base || base.length > 253) return false;
-  const labels = base.split('.');
-  if (labels.length < 2) return false;
-  return labels.every((l) => /^[a-z0-9-]{1,63}$/.test(l) && !l.startsWith('-') && !l.endsWith('-'));
-}
-
 /** 表格列宽：选择 / 名称 / 域名 / 状态 / 方案 / 拦截模式 / 操作 */
 const COLS = 'grid-cols-[24px_minmax(90px,1fr)_minmax(130px,1.2fr)_80px_150px_130px_64px]';
+
+const BATCH_PLACEHOLDER = '__placeholder__';
+const BATCH_FOLLOW_ACTIVE = '__follow__';
 
 type Filter = 'all' | SiteCategory;
 
@@ -115,6 +109,10 @@ export default function SitesTab() {
   /** 例外文本框的编辑态（不回写用户输入，避免打字时被规范化打断） */
   const [excludeText, setExcludeText] = useState('');
   const excludeTimer = useRef<number | null>(null);
+  const excludeTextRef = useRef('');
+  const excludeHostsRef = useRef<string[]>([]);
+  const siteSaveTimer = useRef<number | null>(null);
+  const sitesRef = useRef<SiteRule[]>([]);
   const [globalGranted, setGlobalGranted] = useState(false);
   const [grantedSites, setGrantedSites] = useState<Set<string>>(new Set());
   const [globalMode, setGlobalMode] = useState<SiteMode>('preview');
@@ -123,6 +121,7 @@ export default function SitesTab() {
   const [filter, setFilter] = useState<Filter>('all');
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [showAdd, setShowAdd] = useState(false);
+  const [addError, setAddError] = useState('');
   const [draft, setDraft] = useState({
     name: '',
     host: '',
@@ -130,6 +129,10 @@ export default function SitesTab() {
     schemeId: '',
     mode: 'preview' as SiteMode,
   });
+
+  sitesRef.current = sites;
+  excludeTextRef.current = excludeText;
+  excludeHostsRef.current = excludeHosts;
 
   useEffect(() => {
     void Promise.all([getSites(), getSchemes(), getSettings()]).then(([s, sch, st]) => {
@@ -143,13 +146,47 @@ export default function SitesTab() {
     });
   }, []);
 
+  // 卸载时落盘挂起的防抖编辑（例外主机与站点文本字段），避免切 Tab 丢失
+  useEffect(() => {
+    return () => {
+      if (excludeTimer.current != null) {
+        window.clearTimeout(excludeTimer.current);
+        excludeTimer.current = null;
+        const next = parseExcludeText(excludeTextRef.current);
+        if (next.join('\n') !== excludeHostsRef.current.join('\n')) {
+          void updateSettings({ excludeHosts: next });
+        }
+      }
+      if (siteSaveTimer.current != null) {
+        window.clearTimeout(siteSaveTimer.current);
+        siteSaveTimer.current = null;
+        void saveSites(sitesRef.current);
+      }
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!showAdd) return;
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        setShowAdd(false);
+      }
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [showAdd]);
+
+  const permissionKey = sites.map((s) => `${s.id}:${s.host}`).join('|');
+
   useEffect(() => {
     let stopped = false;
     async function refreshPermissions() {
+      const currentSites = sitesRef.current;
       const [global, granted] = await Promise.all([
         chrome.permissions.contains({ origins: ['*://*/*'] }),
         Promise.all(
-          sites.map(async (site) =>
+          currentSites.map(async (site) =>
             (await chrome.permissions
               .contains({ origins: hostToOrigins(site.host) })
               .catch(() => false))
@@ -170,12 +207,38 @@ export default function SitesTab() {
       chrome.permissions.onAdded.removeListener(refreshPermissions);
       chrome.permissions.onRemoved.removeListener(refreshPermissions);
     };
-  }, [sites]);
+  }, [permissionKey]);
 
-  async function persistSites(next: SiteRule[]) {
+  async function persistSites(next: SiteRule[], refreshRegistrations = true) {
+    if (siteSaveTimer.current != null) {
+      window.clearTimeout(siteSaveTimer.current);
+      siteSaveTimer.current = null;
+    }
+    sitesRef.current = next;
     setSites(next);
     await saveSites(next);
-    await sendMessage({ type: 'REFRESH_SITE_REGISTRATIONS' });
+    if (refreshRegistrations) {
+      await sendMessage({ type: 'REFRESH_SITE_REGISTRATIONS' });
+    }
+  }
+
+  /** 仅修改站点文本字段（名称 / 选择器）：本地立即回显 + 300ms 防抖落盘，不触发脚本重注册 */
+  function updateSiteFieldDebounced(id: string, patch: Partial<SiteRule>) {
+    const next = sitesRef.current.map((s) => (s.id === id ? { ...s, ...patch } : s));
+    sitesRef.current = next;
+    setSites(next);
+    if (siteSaveTimer.current != null) window.clearTimeout(siteSaveTimer.current);
+    siteSaveTimer.current = window.setTimeout(() => {
+      siteSaveTimer.current = null;
+      void saveSites(sitesRef.current);
+    }, 300);
+  }
+
+  function flushSiteFieldSave() {
+    if (siteSaveTimer.current == null) return;
+    window.clearTimeout(siteSaveTimer.current);
+    siteSaveTimer.current = null;
+    void saveSites(sitesRef.current);
   }
 
   async function persistScope(next: SiteScope) {
@@ -185,7 +248,7 @@ export default function SitesTab() {
   }
 
   async function enableGlobal() {
-    const granted = await chrome.permissions.request({ origins: ['*://*/*'] });
+    const granted = await chrome.permissions.request({ origins: ['*://*/*'] }).catch(() => false);
     if (!granted) {
       setNotice(t.options.permissionDenied);
       return;
@@ -209,14 +272,15 @@ export default function SitesTab() {
 
   /** 停止输入 500ms 后落盘；失焦时立即落盘 */
   function scheduleExcludeCommit(text: string) {
-    if (excludeTimer.current) window.clearTimeout(excludeTimer.current);
+    if (excludeTimer.current != null) window.clearTimeout(excludeTimer.current);
     excludeTimer.current = window.setTimeout(() => {
+      excludeTimer.current = null;
       void persistExcludeHosts(parseExcludeText(text));
     }, 500);
   }
 
   function commitExcludeText(text: string) {
-    if (excludeTimer.current) {
+    if (excludeTimer.current != null) {
       window.clearTimeout(excludeTimer.current);
       excludeTimer.current = null;
     }
@@ -225,47 +289,75 @@ export default function SitesTab() {
     void persistExcludeHosts(next);
   }
 
-  /** 单个站点启停（状态列点击）：启用申请权限，停用交还权限 */
+  /** 单个站点启停（状态列点击）：启用申请权限，停用按引用计数安全交还权限 */
   async function toggleSite(site: SiteRule) {
     const enable = !site.enabled || !grantedSites.has(site.id);
+    const next = sitesRef.current.map((s) => (s.id === site.id ? { ...s, enabled: enable } : s));
     if (enable) {
       const origins = hostToOrigins(site.host);
-      const granted = await chrome.permissions.request({ origins });
+      const granted = await chrome.permissions.request({ origins }).catch(() => false);
       if (!granted) {
         setNotice(t.options.permissionDenied);
         return;
       }
       setNotice(t.options.refreshHint);
     } else {
-      const origins = hostToOrigins(site.host);
-      await chrome.permissions.remove({ origins }).catch(() => {});
+      const removable = getRemovableOrigins(
+        [site],
+        next.filter((s) => s.id !== site.id),
+        scope,
+      );
+      if (removable.length > 0) {
+        await chrome.permissions.remove({ origins: removable }).catch(() => {});
+      }
       setNotice('');
     }
-    await persistSites(sites.map((s) => (s.id === site.id ? { ...s, enabled: enable } : s)));
+    await persistSites(next, true);
   }
 
-  function updateSite(id: string, patch: Partial<SiteRule>) {
-    void persistSites(sites.map((s) => (s.id === id ? { ...s, ...patch } : s)));
+  function updateSiteMeta(id: string, patch: Partial<SiteRule>) {
+    void persistSites(
+      sitesRef.current.map((s) => (s.id === id ? { ...s, ...patch } : s)),
+      false,
+    );
+  }
+
+  async function deleteSite(site: SiteRule) {
+    const remaining = sitesRef.current.filter((s) => s.id !== site.id);
+    setSelected((prev) => {
+      if (!prev.has(site.id)) return prev;
+      const next = new Set(prev);
+      next.delete(site.id);
+      return next;
+    });
+    if (site.enabled) {
+      const removable = getRemovableOrigins([site], remaining, scope);
+      if (removable.length > 0) {
+        await chrome.permissions.remove({ origins: removable }).catch(() => {});
+      }
+    }
+    await persistSites(remaining, true);
   }
 
   function openAdd() {
     setDraft({ name: '', host: '', category: 'custom', schemeId: '', mode: 'preview' });
+    setAddError('');
     setNotice('');
     setShowAdd(true);
   }
 
   function submitAdd() {
-    const host = draft.host.trim().toLowerCase();
+    const host = draft.host.trim().toLowerCase().replace(/\.$/, '');
     if (!host) {
-      setNotice(t.options.addSiteEmpty);
+      setAddError(t.options.addSiteEmpty);
       return;
     }
     if (!isValidHostPattern(host)) {
-      setNotice(t.options.invalidDomain);
+      setAddError(t.options.invalidDomain);
       return;
     }
-    if (sites.some((s) => normalizeHost(s.host) === normalizeHost(host))) {
-      setNotice(t.options.invalidDomain);
+    if (sitesRef.current.some((s) => normalizeHost(s.host) === normalizeHost(host))) {
+      setAddError(t.options.duplicateDomain);
       return;
     }
     const site: SiteRule = {
@@ -277,14 +369,18 @@ export default function SitesTab() {
       mode: draft.mode,
       category: draft.category,
     };
-    void persistSites([...sites, site]);
+    void persistSites([...sitesRef.current, site], true);
+    setAddError('');
     setShowAdd(false);
     setNotice(t.options.addSiteSuccess);
   }
 
   function copyAiPrompt(host: string) {
     const prompt = t.options.selectorAiPrompt.replace('{host}', host || '（目标站点域名）');
-    void navigator.clipboard.writeText(prompt).then(() => setNotice(t.options.aiPromptCopied));
+    void navigator.clipboard
+      .writeText(prompt)
+      .then(() => setNotice(t.options.aiPromptCopied))
+      .catch(() => setNotice('复制失败'));
   }
 
   // ---------- 批量选择与操作 ----------
@@ -304,38 +400,48 @@ export default function SitesTab() {
 
   /** 批量启用：一次性申请所有选中站点权限后启用 */
   async function batchEnable() {
-    const targets = sites.filter((s) => selected.has(s.id));
+    const targets = sitesRef.current.filter((s) => selected.has(s.id));
     if (targets.length === 0) {
       clearSelection();
       return;
     }
     const origins = Array.from(new Set(targets.flatMap((s) => hostToOrigins(s.host))));
-    const granted = await chrome.permissions.request({ origins });
+    const granted = await chrome.permissions.request({ origins }).catch(() => false);
     if (!granted) {
       setNotice(t.options.permissionDenied);
       return;
     }
-    await persistSites(sites.map((s) => (selected.has(s.id) ? { ...s, enabled: true } : s)));
+    await persistSites(
+      sitesRef.current.map((s) => (selected.has(s.id) ? { ...s, enabled: true } : s)),
+      true,
+    );
     setNotice(t.options.refreshHint);
     clearSelection();
   }
 
-  /** 批量关闭：停用并交还权限 */
+  /** 批量关闭：停用并安全交还不再需要的权限 */
   async function batchDisable() {
-    const targets = sites.filter((s) => selected.has(s.id) && s.enabled);
-    const origins = Array.from(new Set(targets.flatMap((s) => hostToOrigins(s.host))));
-    if (origins.length) await chrome.permissions.remove({ origins }).catch(() => {});
-    await persistSites(sites.map((s) => (selected.has(s.id) ? { ...s, enabled: false } : s)));
+    const targets = sitesRef.current.filter((s) => selected.has(s.id) && s.enabled);
+    const next = sitesRef.current.map((s) => (selected.has(s.id) ? { ...s, enabled: false } : s));
+    const removable = getRemovableOrigins(targets, next, scope);
+    if (removable.length) await chrome.permissions.remove({ origins: removable }).catch(() => {});
+    await persistSites(next, true);
     clearSelection();
   }
 
   function batchSetMode(mode: SiteMode) {
-    void persistSites(sites.map((s) => (selected.has(s.id) ? { ...s, mode } : s)));
+    void persistSites(
+      sitesRef.current.map((s) => (selected.has(s.id) ? { ...s, mode } : s)),
+      false,
+    );
     clearSelection();
   }
 
   function batchSetScheme(schemeId: string) {
-    void persistSites(sites.map((s) => (selected.has(s.id) ? { ...s, schemeId } : s)));
+    void persistSites(
+      sitesRef.current.map((s) => (selected.has(s.id) ? { ...s, schemeId } : s)),
+      false,
+    );
     clearSelection();
   }
 
@@ -365,7 +471,8 @@ export default function SitesTab() {
           <input
             className="min-w-0 w-full rounded border border-transparent bg-transparent px-1.5 py-0.5 text-sm outline-none hover:border-[var(--vesper-border)] focus:border-black"
             value={site.name ?? ''}
-            onChange={(e) => updateSite(site.id, { name: e.target.value })}
+            onChange={(e) => updateSiteFieldDebounced(site.id, { name: e.target.value })}
+            onBlur={flushSiteFieldSave}
             placeholder={
               SITE_DISPLAY_NAMES[normalizeHost(site.host)] ?? t.options.siteNamePlaceholder
             }
@@ -383,8 +490,8 @@ export default function SitesTab() {
           />
           <select
             className="w-full rounded border border-[var(--vesper-border)] bg-white px-1.5 py-1 text-xs"
-            value={site.schemeId}
-            onChange={(e) => updateSite(site.id, { schemeId: e.target.value })}
+            value={schemes.some((s) => s.id === site.schemeId) ? site.schemeId : ''}
+            onChange={(e) => updateSiteMeta(site.id, { schemeId: e.target.value })}
           >
             <option value="">{t.options.followActive}</option>
             {schemes.map((s) => (
@@ -396,7 +503,7 @@ export default function SitesTab() {
           <select
             className="w-full rounded border border-[var(--vesper-border)] bg-white px-1.5 py-1 text-xs"
             value={site.mode}
-            onChange={(e) => updateSite(site.id, { mode: e.target.value as SiteMode })}
+            onChange={(e) => updateSiteMeta(site.id, { mode: e.target.value as SiteMode })}
           >
             <option value="preview">{t.options.modePreview}</option>
             <option value="auto">{t.options.modeAuto}</option>
@@ -404,6 +511,7 @@ export default function SitesTab() {
           </select>
           <div className="flex items-center justify-end gap-1">
             <button
+              type="button"
               className={`rounded p-1 hover:bg-neutral-200 ${isOpen ? 'text-black' : 'text-neutral-500'}`}
               title={t.common.edit}
               onClick={() => setExpanded({ ...expanded, [site.id]: !isOpen })}
@@ -411,9 +519,10 @@ export default function SitesTab() {
               {EditIcon}
             </button>
             <button
+              type="button"
               className="rounded p-1 text-neutral-500 hover:bg-neutral-200 hover:text-black"
               title={t.common.delete}
-              onClick={() => void persistSites(sites.filter((s) => s.id !== site.id))}
+              onClick={() => void deleteSite(site)}
             >
               {TrashIcon}
             </button>
@@ -430,11 +539,15 @@ export default function SitesTab() {
                 className="w-full rounded border border-[var(--vesper-border)] bg-white px-1.5 py-1 font-mono"
                 placeholder="CSS 选择器，如 div#chat-input textarea"
                 value={site.selector ?? ''}
-                onChange={(e) => updateSite(site.id, { selector: e.target.value || undefined })}
+                onChange={(e) =>
+                  updateSiteFieldDebounced(site.id, { selector: e.target.value || undefined })
+                }
+                onBlur={flushSiteFieldSave}
               />
             </div>
             <div />
             <button
+              type="button"
               className="w-full rounded border border-[var(--vesper-border)] bg-white px-1.5 py-1 text-[var(--vesper-text-dim)] hover:border-black"
               onClick={() => copyAiPrompt(site.host)}
             >
@@ -455,6 +568,7 @@ export default function SitesTab() {
         <h3 className="mb-2 text-sm font-semibold">{t.options.scopeTitle}</h3>
         <div className="grid gap-2 sm:grid-cols-2">
           <button
+            type="button"
             className={`rounded-lg border p-3 text-left text-sm ${
               scope === 'global'
                 ? 'border-black bg-neutral-50'
@@ -490,6 +604,7 @@ export default function SitesTab() {
             )}
           </button>
           <button
+            type="button"
             className={`rounded-lg border p-3 text-left text-sm ${
               scope === 'list'
                 ? 'border-black bg-neutral-50'
@@ -569,18 +684,25 @@ export default function SitesTab() {
               {(['all', ...SITE_CATEGORY_ORDER] as Filter[]).map((f) => (
                 <button
                   key={f}
+                  type="button"
                   className={`rounded-full px-3 py-1 text-xs ${
                     filter === f
                       ? 'bg-black text-white'
                       : 'border border-[var(--vesper-border)] text-[var(--vesper-text-dim)] hover:border-black'
                   }`}
-                  onClick={() => setFilter(f)}
+                  onClick={() => {
+                    if (filter !== f) {
+                      setFilter(f);
+                      clearSelection();
+                    }
+                  }}
                 >
                   {f === 'all' ? t.options.filterAll : t.options.categoryNames[f]}
                 </button>
               ))}
             </div>
             <button
+              type="button"
               className="shrink-0 rounded-md bg-black px-4 py-1.5 text-sm font-medium text-white hover:brightness-150"
               onClick={openAdd}
             >
@@ -593,38 +715,46 @@ export default function SitesTab() {
             <div className="flex flex-wrap items-center gap-2 rounded-md border border-[var(--vesper-border)] bg-neutral-50 px-3 py-2 text-xs">
               <span className="font-medium">{t.options.selectedCount(selected.size)}</span>
               <button
+                type="button"
                 className="rounded border border-[var(--vesper-border)] bg-white px-2 py-1 hover:border-black"
                 onClick={() => void batchEnable()}
               >
                 {t.common.enable}
               </button>
               <button
+                type="button"
                 className="rounded border border-[var(--vesper-border)] bg-white px-2 py-1 hover:border-black"
                 onClick={() => void batchDisable()}
               >
                 {t.options.batchDisable}
               </button>
               <select
+                aria-label={t.options.batchMode}
                 className="rounded border border-[var(--vesper-border)] bg-white px-2 py-1"
-                value=""
+                value={BATCH_PLACEHOLDER}
                 onChange={(e) => {
-                  if (e.target.value) batchSetMode(e.target.value as SiteMode);
+                  if (e.target.value !== BATCH_PLACEHOLDER) {
+                    batchSetMode(e.target.value as SiteMode);
+                  }
                 }}
               >
-                <option value="">拦截模式</option>
+                <option value={BATCH_PLACEHOLDER}>{t.options.batchMode}</option>
                 <option value="preview">{t.options.modePreview}</option>
                 <option value="auto">{t.options.modeAuto}</option>
                 <option value="warn-only">{t.options.modeWarnOnly}</option>
               </select>
               <select
+                aria-label={t.options.batchBindScheme}
                 className="rounded border border-[var(--vesper-border)] bg-white px-2 py-1"
-                value=""
+                value={BATCH_PLACEHOLDER}
                 onChange={(e) => {
-                  if (e.target.value !== '') batchSetScheme(e.target.value);
+                  const val = e.target.value;
+                  if (val === BATCH_PLACEHOLDER) return;
+                  batchSetScheme(val === BATCH_FOLLOW_ACTIVE ? '' : val);
                 }}
               >
-                <option value="">绑定方案</option>
-                <option value="">{t.options.followActive}</option>
+                <option value={BATCH_PLACEHOLDER}>{t.options.batchBindScheme}</option>
+                <option value={BATCH_FOLLOW_ACTIVE}>{t.options.followActive}</option>
                 {schemes.map((s) => (
                   <option key={s.id} value={s.id}>
                     {s.name}
@@ -632,6 +762,7 @@ export default function SitesTab() {
                 ))}
               </select>
               <button
+                type="button"
                 className="ml-auto text-[var(--vesper-text-dim)] hover:text-black"
                 onClick={clearSelection}
               >
@@ -668,24 +799,49 @@ export default function SitesTab() {
         </section>
       )}
 
-      {/* 添加站点弹框 */}
+      {/* 添加站点弹框：禁用点击遮罩误关，校验提示内联展示 */}
       {showAdd && (
         <div
-          className="fixed inset-0 z-50 flex items-center justify-center bg-black/30 p-4"
-          onClick={() => setShowAdd(false)}
+          data-testid="add-site-modal"
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4"
         >
           <div
-            className="w-full max-w-md rounded-lg bg-white p-5 shadow-xl"
-            onClick={(e) => e.stopPropagation()}
+            role="dialog"
+            aria-modal="true"
+            aria-label={t.options.addSiteTitle}
+            className="w-full max-w-md rounded-xl border border-[var(--vesper-border)] bg-white p-5 shadow-xl"
           >
-            <h3 className="mb-4 text-sm font-semibold">{t.options.addSiteTitle}</h3>
+            <div className="mb-4 flex items-center justify-between">
+              <h3 className="text-sm font-semibold">{t.options.addSiteTitle}</h3>
+              <button
+                type="button"
+                aria-label={t.options.closeModal}
+                title={t.options.closeModal}
+                className="rounded p-1 text-neutral-500 hover:bg-neutral-100 hover:text-black"
+                onClick={() => setShowAdd(false)}
+              >
+                <svg
+                  width="16"
+                  height="16"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="2"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                >
+                  <path d="M18 6 6 18" />
+                  <path d="m6 6 12 12" />
+                </svg>
+              </button>
+            </div>
             <div className="space-y-3 text-sm">
               <label className="block">
                 <span className="mb-1 block text-xs text-[var(--vesper-text-dim)]">
                   {t.options.fieldName}
                 </span>
                 <input
-                  className="w-full rounded-md border border-[var(--vesper-border)] px-3 py-2"
+                  className="w-full rounded-md border border-[var(--vesper-border)] px-3 py-2 outline-none focus:border-black"
                   value={draft.name}
                   onChange={(e) => setDraft({ ...draft, name: e.target.value })}
                   placeholder={t.options.siteNamePlaceholder}
@@ -696,9 +852,12 @@ export default function SitesTab() {
                   {t.options.fieldHost}
                 </span>
                 <input
-                  className="w-full rounded-md border border-[var(--vesper-border)] px-3 py-2 font-mono"
+                  className="w-full rounded-md border border-[var(--vesper-border)] px-3 py-2 font-mono outline-none focus:border-black"
                   value={draft.host}
-                  onChange={(e) => setDraft({ ...draft, host: e.target.value })}
+                  onChange={(e) => {
+                    setDraft({ ...draft, host: e.target.value });
+                    if (addError) setAddError('');
+                  }}
                   placeholder="*.example.com"
                   autoFocus
                 />
@@ -756,14 +915,17 @@ export default function SitesTab() {
                 </select>
               </label>
             </div>
+            {addError && <div className="mt-3 text-xs text-red-600">{addError}</div>}
             <div className="mt-5 flex justify-end gap-2">
               <button
+                type="button"
                 className="rounded-md border border-[var(--vesper-border)] px-4 py-2 text-sm hover:border-black"
                 onClick={() => setShowAdd(false)}
               >
                 {t.common.cancel}
               </button>
               <button
+                type="button"
                 className="rounded-md bg-black px-4 py-2 text-sm font-medium text-white hover:brightness-150"
                 onClick={submitAdd}
               >
