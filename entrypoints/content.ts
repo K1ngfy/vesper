@@ -17,6 +17,7 @@ import { desensitize } from '@/src/core/engine';
 import type { DesensitizeResult, Scheme, SiteRule } from '@/src/core/types';
 import { ENGINE_PORT, sendMessage } from '@/src/messages';
 import { pickAdapter } from '@/src/content/adapters';
+import { installClipboardGuard } from '@/src/content/clipboard-guard';
 import { captureInsertion } from '@/src/content/insert';
 import { closePreview, isOwnUI, showPreview, showProcessing, showToast } from '@/src/content/ui';
 import { t } from '@/src/i18n';
@@ -67,8 +68,31 @@ export default defineContentScript({
     if (w[flag]) return;
     w[flag] = true;
 
+    installClipboardGuard();
     const adapter = pickAdapter(location.href);
     void refreshCtx();
+
+    // Arc 浏览器会在网页根节点异步注入 --arc-palette-* 主题变量；记录标记以便侧边栏直接走独立窗口模式
+    window.addEventListener(
+      'load',
+      () => {
+        setTimeout(() => {
+          try {
+            const s = getComputedStyle(document.documentElement);
+            if (
+              s.getPropertyValue('--arc-palette-title').trim() ||
+              s.getPropertyValue('--arc-palette-background').trim() ||
+              s.getPropertyValue('--arc-background-simple-color').trim()
+            ) {
+              void chrome.storage?.local?.set({ 'vesper:isArc': true }).catch(() => {});
+            }
+          } catch {
+            // 忽略受限页面样式读取异常
+          }
+        }, 600);
+      },
+      { once: true },
+    );
 
     // 配置（方案/站点/设置）变化时刷新上下文：
     // Popup 切换"当前方案"后，已打开的页面无需刷新即按新方案拦截

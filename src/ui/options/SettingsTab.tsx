@@ -3,12 +3,21 @@
  * 映射保留开关（默认关 + 风险提示）、一键清除、关于与隐私声明。
  */
 import { useEffect, useRef, useState } from 'react';
+import {
+  GITHUB_RELEASES_URL,
+  GITHUB_REPO_URL,
+  hasAvailableUpdate,
+  type UpdateState,
+} from '../../core/update';
 import { sendMessage } from '../../messages';
 import {
   clearAll,
+  ensureSeeded,
   exportAll,
   getSettings,
+  getUpdateState,
   importAll,
+  UPDATE_STATE_KEY,
   updateSettings,
   validateImport,
   type ExportBundle,
@@ -17,15 +26,28 @@ import {
 import { t } from '../../i18n';
 import Toggle from '../Toggle';
 
-const GITHUB_URL = 'https://github.com/K1ngfy/vesper';
-
 export default function SettingsTab() {
   const [settings, setSettings] = useState<Settings | null>(null);
+  const [updateState, setUpdateState] = useState<UpdateState | undefined>(undefined);
+  const [checkingUpdate, setCheckingUpdate] = useState(false);
+  const [updateMsg, setUpdateMsg] = useState('');
   const [notice, setNotice] = useState('');
   const fileRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
-    void getSettings().then((s) => s && setSettings(s));
+    void ensureSeeded()
+      .then(() => Promise.all([getSettings(), getUpdateState()]))
+      .then(([s, u]) => {
+        if (s) setSettings(s);
+        setUpdateState(u);
+      });
+    const onChange = (changes: Record<string, chrome.storage.StorageChange>, area: string) => {
+      if (area === 'local' && UPDATE_STATE_KEY in changes) {
+        setUpdateState(changes[UPDATE_STATE_KEY]?.newValue as UpdateState | undefined);
+      }
+    };
+    chrome.storage.onChanged.addListener(onChange);
+    return () => chrome.storage.onChanged.removeListener(onChange);
   }, []);
 
   async function update(patch: Partial<Settings>) {
@@ -85,7 +107,28 @@ export default function SettingsTab() {
     await update({ persistMappings: checked });
   }
 
+  async function onCheckUpdate() {
+    setCheckingUpdate(true);
+    setUpdateMsg('');
+    try {
+      const next = await sendMessage({ type: 'CHECK_UPDATE', force: true });
+      setUpdateState(next);
+      if (next?.lastError) {
+        setUpdateMsg(t.options.checkUpdateFailed(next.lastError));
+      } else if (hasAvailableUpdate(version, next) && next?.latestVersion) {
+        setUpdateMsg(t.options.updateAvailableText(next.latestVersion));
+      } else {
+        setUpdateMsg(t.options.upToDate(version));
+      }
+    } catch {
+      setUpdateMsg(t.options.checkUpdateFailed('未知错误'));
+    } finally {
+      setCheckingUpdate(false);
+    }
+  }
+
   const version = chrome.runtime.getManifest().version;
+  const hasUpdate = hasAvailableUpdate(version, updateState);
 
   return (
     <div className="max-w-xl space-y-6">
@@ -94,7 +137,7 @@ export default function SettingsTab() {
           {t.popup.globalSwitch}
           <Toggle
             checked={settings?.globalEnabled ?? true}
-            onChange={(v) => update({ globalEnabled: v })}
+            onChange={(v) => void update({ globalEnabled: v })}
           />
         </label>
 
@@ -108,6 +151,19 @@ export default function SettingsTab() {
           <Toggle
             checked={settings?.persistMappings ?? false}
             onChange={(v) => void onTogglePersistMappings(v)}
+          />
+        </label>
+
+        <label className="flex items-start justify-between gap-4 rounded-lg border border-[var(--vesper-border)] bg-white px-4 py-3 text-sm">
+          <span>
+            <span className="font-medium">{t.options.autoCheckUpdate}</span>
+            <span className="mt-1 block text-[11px] leading-relaxed text-[var(--vesper-text-dim)]">
+              {t.options.autoCheckUpdateDesc}
+            </span>
+          </span>
+          <Toggle
+            checked={settings?.autoCheckUpdate ?? true}
+            onChange={(v) => void update({ autoCheckUpdate: v })}
           />
         </label>
       </section>
@@ -147,28 +203,60 @@ export default function SettingsTab() {
       {notice && <div className="text-sm text-neutral-600">{notice}</div>}
 
       <section className="rounded-lg border border-[var(--vesper-border)] bg-[#ffffff] p-4 text-sm">
-        <div className="mb-2 flex items-center justify-between">
+        <div className="mb-2 flex items-center justify-between gap-2">
           <span className="font-medium">{t.options.about}</span>
-          <a
-            href={GITHUB_URL}
-            target="_blank"
-            rel="noopener noreferrer"
-            aria-label={t.options.githubRepo}
-            title={GITHUB_URL}
-            className="inline-flex items-center justify-center rounded-md p-1 text-[var(--vesper-text-dim)] transition-colors hover:bg-neutral-100 hover:text-[var(--vesper-accent)]"
-          >
-            <svg
-              viewBox="0 0 24 24"
-              width={18}
-              height={18}
-              fill="currentColor"
-              aria-hidden="true"
-              focusable="false"
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              disabled={checkingUpdate}
+              onClick={() => void onCheckUpdate()}
+              className="rounded-md border border-[var(--vesper-border)] bg-white px-2.5 py-1 text-xs text-[var(--vesper-text)] transition-colors hover:border-black disabled:cursor-wait disabled:opacity-60"
             >
-              <path d="M12 .5C5.37.5 0 5.87 0 12.5c0 5.3 3.438 9.8 8.205 11.387.6.113.82-.258.82-.577 0-.285-.01-1.04-.015-2.04-3.338.724-4.042-1.61-4.042-1.61-.546-1.387-1.333-1.756-1.333-1.756-1.09-.745.083-.73.083-.73 1.205.085 1.838 1.238 1.838 1.238 1.07 1.835 2.809 1.305 3.495.998.108-.776.417-1.305.76-1.605-2.665-.3-5.466-1.332-5.466-5.93 0-1.31.465-2.38 1.235-3.22-.135-.303-.54-1.523.105-3.176 0 0 1.005-.322 3.3 1.23.96-.267 1.98-.399 3-.405 1.02.006 2.04.138 3 .405 2.28-1.552 3.285-1.23 3.285-1.23.645 1.653.24 2.873.12 3.176.765.84 1.23 1.91 1.23 3.22 0 4.61-2.805 5.625-5.475 5.92.42.36.81 1.096.81 2.22 0 1.606-.015 2.896-.015 3.286 0 .315.21.69.825.57C20.565 22.295 24 17.798 24 12.5 24 5.87 18.627.5 12 .5z" />
-            </svg>
-          </a>
+              {checkingUpdate ? t.options.checkingUpdate : t.options.checkUpdate}
+            </button>
+            <a
+              href={GITHUB_REPO_URL}
+              target="_blank"
+              rel="noopener noreferrer"
+              aria-label={t.options.githubRepo}
+              title={GITHUB_REPO_URL}
+              className="inline-flex items-center justify-center rounded-md p-1 text-[var(--vesper-text-dim)] transition-colors hover:bg-neutral-100 hover:text-[var(--vesper-accent)]"
+            >
+              <svg
+                viewBox="0 0 24 24"
+                width={18}
+                height={18}
+                fill="currentColor"
+                aria-hidden="true"
+                focusable="false"
+              >
+                <path d="M12 .5C5.37.5 0 5.87 0 12.5c0 5.3 3.438 9.8 8.205 11.387.6.113.82-.258.82-.577 0-.285-.01-1.04-.015-2.04-3.338.724-4.042-1.61-4.042-1.61-.546-1.387-1.333-1.756-1.333-1.756-1.09-.745.083-.73.083-.73 1.205.085 1.838 1.238 1.838 1.238 1.07 1.835 2.809 1.305 3.495.998.108-.776.417-1.305.76-1.605-2.665-.3-5.466-1.332-5.466-5.93 0-1.31.465-2.38 1.235-3.22-.135-.303-.54-1.523.105-3.176 0 0 1.005-.322 3.3 1.23.96-.267 1.98-.399 3-.405 1.02.006 2.04.138 3 .405 2.28-1.552 3.285-1.23 3.285-1.23.645 1.653.24 2.873.12 3.176.765.84 1.23 1.91 1.23 3.22 0 4.61-2.805 5.625-5.475 5.92.42.36.81 1.096.81 2.22 0 1.606-.015 2.896-.015 3.286 0 .315.21.69.825.57C20.565 22.295 24 17.798 24 12.5 24 5.87 18.627.5 12 .5z" />
+              </svg>
+            </a>
+          </div>
         </div>
+        {hasUpdate && updateState?.latestVersion && (
+          <div
+            data-testid="update-available-banner"
+            className="mb-3 flex flex-wrap items-center justify-between gap-2 rounded-md border border-red-200 bg-red-50/80 px-3 py-2 text-xs text-red-900"
+          >
+            <span className="inline-flex items-center gap-1.5 font-medium">
+              <span className="inline-block h-2 w-2 rounded-full bg-red-500" />
+              {t.options.updateAvailableText(updateState.latestVersion)}
+            </span>
+            <a
+              href={updateState.releaseUrl ?? GITHUB_RELEASES_URL}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="rounded bg-black px-2.5 py-1 font-medium text-white hover:bg-neutral-800"
+            >
+              {t.options.downloadUpdate}
+            </a>
+          </div>
+        )}
+        {updateMsg && !hasUpdate && (
+          <div className="mb-2 text-xs text-[var(--vesper-text-dim)]">{updateMsg}</div>
+        )}
         <div className="space-y-1 text-xs text-[var(--vesper-text-dim)]">
           <div>
             VESPER v{version} · {t.slogan}

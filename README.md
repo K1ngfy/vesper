@@ -81,19 +81,20 @@ e2e/                  Playwright 扩展 E2E
 | `offscreen` | 启动扩展自己的脱敏 Worker，用于较长文本和自定义正则 |
 | `clipboardWrite` | 自动回填失败时复制结果 |
 | `activeTab` | Popup 显示当前标签页站点的拦截状态 |
+| `alarms` | 定期后台检查 GitHub Release 新版本（可在设置页关闭） |
 | `optional_host_permissions` | 用户添加站点时按域名逐个申请，默认不申请任何主机权限 |
 
 ## 隐私声明
 
 VESPER processes all text locally on your device. It collects, stores remotely, and
-transmits no data. Your rules and texts never leave your browser.
+transmits no user data. Your rules and texts never leave your browser.
 
-代码库不含任何 `fetch` / `XHR` / `WebSocket` 外发调用与统计 SDK；不读 Cookie、不碰账号凭据、不使用 `chrome.storage.sync`。
+所有脱敏处理与规则存储均在本机完成；除可选的公开 GitHub Releases 版本更新检查（`credentials: 'omit'`，零用户数据与凭据，可在设置中关闭）外，不含任何数据外发调用与统计 SDK；不读 Cookie、不碰账号凭据、不使用 `chrome.storage.sync`。
 
 ## 配色
 
-**极简黑白**：背景 `#ffffff`，文本 `#111111`，次级文本 `#6b7280`，
-边框 `#e5e5e5`，主色（按钮/强调/品牌徽标）`#111111` 黑。品牌标志采用「半阖之瞳（Veiled Eye）」纯矢量图形。
+**极简黑白主框架 + 语义高亮**：界面主背景 `#ffffff`，文本 `#111111`，次级文本 `#6b7280`，
+边框 `#e5e5e5`，主色（按钮/强调/品牌徽标）`#111111` 黑；工作台与侧边栏中脱敏占位符采用淡蓝色高亮，还原敏感原文采用淡红色警示高亮。品牌标志采用「半阖之瞳（Veiled Eye）」纯矢量图形。
 所有颜色集中在 `src/ui/global.css` 的 CSS 变量；改动只需调变量即可全局生效。
 
 ## 这个插件做不了什么 / 合规红线

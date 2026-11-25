@@ -23,6 +23,7 @@ import {
 } from '../core/presets';
 import { getDetector } from '../core/detectors';
 import type { Scheme, SiteMode, SiteRule, SiteScope } from '../core/types';
+import type { UpdateState } from '../core/update';
 
 export interface Settings {
   globalEnabled: boolean;
@@ -37,6 +38,8 @@ export interface Settings {
   globalMode: SiteMode;
   /** 全局模式下的排除名单（域名数组）；list 模式下忽略 */
   excludeHosts: string[];
+  /** 是否定期自动通过公开 GitHub Releases API 检查版本更新（默认开） */
+  autoCheckUpdate?: boolean;
 }
 
 export interface MappingRecord {
@@ -48,6 +51,7 @@ export interface MappingRecord {
 
 export const LAST_MAPPING_KEY = 'vesper:lastMapping';
 export const MAPPING_HISTORY_KEY = 'vesper:mappings';
+export const UPDATE_STATE_KEY = 'vesper:update';
 
 const KEYS = {
   schemes: 'vesper:schemes',
@@ -107,6 +111,7 @@ async function doEnsureSeeded(): Promise<void> {
       siteScope: 'list',
       globalMode: 'preview',
       excludeHosts: [...DEFAULT_EXCLUDE_HOSTS],
+      autoCheckUpdate: true,
     } satisfies Settings);
   }
 
@@ -434,6 +439,16 @@ export async function getLatestMapping(): Promise<MappingRecord | undefined> {
   return last ?? ((await getSettings())?.persistMappings ? (await getMappings())[0] : undefined);
 }
 
+// ---------- 版本更新状态 ----------
+
+export async function getUpdateState(): Promise<UpdateState | undefined> {
+  return get<UpdateState>(UPDATE_STATE_KEY);
+}
+
+export async function saveUpdateState(state: UpdateState): Promise<void> {
+  await set(UPDATE_STATE_KEY, state);
+}
+
 // ---------- 导入 / 导出 / 清除 ----------
 
 export interface ExportBundle {
@@ -460,6 +475,7 @@ export async function exportAll(): Promise<ExportBundle> {
       siteScope: settings?.siteScope ?? 'list',
       globalMode: settings?.globalMode ?? 'preview',
       excludeHosts: settings?.excludeHosts ?? [],
+      autoCheckUpdate: settings?.autoCheckUpdate ?? true,
     },
   };
 }
@@ -487,7 +503,8 @@ export function validateImport(data: unknown): string | null {
     (settings.globalMode !== undefined && !modes.includes(settings.globalMode)) ||
     (settings.excludeHosts !== undefined &&
       (!Array.isArray(settings.excludeHosts) ||
-        settings.excludeHosts.some((h) => typeof h !== 'string')))
+        settings.excludeHosts.some((h) => typeof h !== 'string'))) ||
+    (settings.autoCheckUpdate !== undefined && typeof settings.autoCheckUpdate !== 'boolean')
   ) {
     return '设置结构不合法';
   }
@@ -605,6 +622,7 @@ export async function importAll(bundle: ExportBundle): Promise<void> {
       siteScope: bundle.settings.siteScope ?? 'list',
       globalMode: bundle.settings.globalMode ?? 'preview',
       excludeHosts: bundle.settings.excludeHosts ?? [...DEFAULT_EXCLUDE_HOSTS],
+      autoCheckUpdate: bundle.settings.autoCheckUpdate ?? true,
       dailyCount: current?.dailyCount ?? { date: today(), count: 0 },
     };
     await chrome.storage.local.set({

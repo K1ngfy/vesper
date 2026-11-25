@@ -17,6 +17,12 @@
   --vesper-text: #111111;
   --vesper-text-dim: #6b7280;
   --vesper-border: #e5e5e5;
+  --vesper-mark-safe-bg: #eff6ff;
+  --vesper-mark-safe-text: #1d4ed8;
+  --vesper-mark-safe-border: #93c5fd;
+  --vesper-mark-restore-bg: #fef2f2;
+  --vesper-mark-restore-text: #b91c1c;
+  --vesper-mark-restore-border: #fca5a5;
 }
 
 html,
@@ -28,12 +34,23 @@ body {
   margin: 0;
 }
 
-/* 命中高亮：浅灰底 + 黑色字，符合黑白极简 */
-.vesper-mark {
-  background: #f3f4f6;
-  color: #111111;
-  border-radius: 2px;
-  padding: 0 2px;
-  border-bottom: 1px solid #111111;
+/* 脱敏命中高亮：浅蓝底 + 柔和蓝字，标识已安全脱敏的占位符 */
+.vesper-mark,
+.vesper-mark-safe {
+  background: var(--vesper-mark-safe-bg);
+  color: var(--vesper-mark-safe-text);
+  border-radius: 3px;
+  padding: 0 3px;
+  border-bottom: 1px solid var(--vesper-mark-safe-border);
+  cursor: help;
+}
+
+/* 还原原文高亮：浅红底 + 柔和红字，醒目提示还原出的敏感原文 */
+.vesper-mark-restore {
+  background: var(--vesper-mark-restore-bg);
+  color: var(--vesper-mark-restore-text);
+  border-radius: 3px;
+  padding: 0 3px;
+  border-bottom: 1px solid var(--vesper-mark-restore-border);
   cursor: help;
 }

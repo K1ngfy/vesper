@@ -16,7 +16,7 @@
  * 隐私红线（文档第 8 节）：本文件禁止 console.log 打印原文/映射。
  */
 import { getDetector } from './detectors';
-import type { DesensitizeResult, Hit, Rule, Scheme } from './types';
+import type { DesensitizeResult, Hit, ReplaceMode, Rule, Scheme } from './types';
 
 const TOKEN_START = '\uE000';
 const TOKEN_END = '\uE001';
@@ -267,6 +267,25 @@ export function desensitize(text: string, scheme: Scheme, strict = false): Desen
 
   hits.sort((a, b) => a.index - b.index);
   return { output, hits, mapping: Object.fromEntries(mapping), durationMs: Date.now() - start };
+}
+
+/** 快捷切换规则替换方式时，自动补全空替换文本或同步默认占位符（如 [EMAIL_n] ↔ [EMAIL]） */
+export function applyRuleModeChange(rule: Rule, mode: ReplaceMode): Rule {
+  if (rule.mode === mode) return rule;
+  const det = rule.type === 'builtin' ? getDetector(rule.pattern) : undefined;
+  const numberedDefault = det?.defaultReplacement ?? '[MASKED_n]';
+  const fixedDefault = numberedDefault.replace(/_n(?=\]|$)/, '');
+  let replacement = rule.replacement;
+  if (mode === 'numbered') {
+    if (!replacement.trim() || replacement === fixedDefault) {
+      replacement = numberedDefault;
+    }
+  } else if (mode === 'fixed') {
+    if (!replacement.trim() || replacement === numberedDefault) {
+      replacement = fixedDefault;
+    }
+  }
+  return { ...rule, mode, replacement };
 }
 
 /** 规则测试台用：用单条规则对样本文本试跑（非法正则直接向上抛错给编辑器提示；已停用规则也强制启用测试） */

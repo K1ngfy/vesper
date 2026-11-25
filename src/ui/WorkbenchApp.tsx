@@ -31,7 +31,13 @@ const FILE_EXTS = ['.txt', '.log', '.md', '.json', '.csv'];
 
 type Mode = 'desensitize' | 'restore';
 
-export default function WorkbenchApp() {
+export interface WorkbenchAppProps {
+  /** 布局方向：独立工作台默认左右分栏（horizontal），侧边栏采用上下分栏（vertical） */
+  layout?: 'horizontal' | 'vertical';
+}
+
+export default function WorkbenchApp({ layout = 'horizontal' }: WorkbenchAppProps = {}) {
+  const isVertical = layout === 'vertical';
   const [schemes, setSchemes] = useState<Scheme[]>([]);
   const [schemeId, setSchemeId] = useState('');
   const [input, setInput] = useState('');
@@ -275,7 +281,7 @@ export default function WorkbenchApp() {
       parts.push(
         <mark
           key={i}
-          className="vesper-mark"
+          className="vesper-mark vesper-mark-safe"
           data-rule={h.ruleId}
           title={`${h.ruleName}：${h.original}`}
         >
@@ -309,7 +315,11 @@ export default function WorkbenchApp() {
       if (mk.index >= maxEnd) break;
       if (mk.index > cursor) parts.push(output.slice(cursor, mk.index));
       parts.push(
-        <mark key={i} className="vesper-mark" title={`${mk.placeholder} → ${mk.original}`}>
+        <mark
+          key={i}
+          className="vesper-mark vesper-mark-restore"
+          title={`${mk.placeholder} → ${mk.original}`}
+        >
           {output.slice(mk.index, mk.index + mk.length)}
         </mark>,
       );
@@ -331,13 +341,19 @@ export default function WorkbenchApp() {
   return (
     <div className="flex h-screen flex-col">
       {/* 顶部：品牌 + 方案选择 + 模式切换 */}
-      <header className="flex items-center gap-4 border-b border-[var(--vesper-border)] px-4 py-3">
-        <span className="inline-flex items-center gap-1.5 text-lg font-bold">
+      <header
+        className={`flex items-center border-b border-[var(--vesper-border)] ${
+          isVertical ? 'flex-wrap gap-2 px-3 py-2.5' : 'gap-4 px-4 py-3'
+        }`}
+      >
+        <span className="inline-flex shrink-0 items-center gap-1.5 text-lg font-bold">
           <VesperLogo size={22} />
           <span>{t.appName}</span>
         </span>
         <select
-          className="rounded-md border border-[var(--vesper-border)] bg-[#ffffff] px-2 py-1 text-sm"
+          className={`rounded-md border border-[var(--vesper-border)] bg-[#ffffff] px-2 py-1 text-sm ${
+            isVertical ? 'min-w-0 max-w-[150px] flex-1 truncate' : ''
+          }`}
           value={scheme?.id ?? ''}
           onChange={(e) => {
             setSchemeId(e.target.value);
@@ -352,7 +368,7 @@ export default function WorkbenchApp() {
             </option>
           ))}
         </select>
-        <div className="ml-auto flex gap-2 text-sm">
+        <div className="ml-auto flex shrink-0 gap-2 text-sm">
           <button
             className={`rounded-md px-3 py-1 ${mode === 'desensitize' ? 'bg-[var(--vesper-accent)] text-white' : 'border border-[var(--vesper-border)]'}`}
             onClick={() => setMode('desensitize')}
@@ -369,10 +385,18 @@ export default function WorkbenchApp() {
       </header>
 
       {mode === 'desensitize' ? (
-        <div className="flex min-h-0 flex-1">
-          {/* 左：原文 */}
+        <div
+          data-testid="workbench-split"
+          className={`flex min-h-0 flex-1 ${isVertical ? 'flex-col' : 'flex-row'}`}
+        >
+          {/* 原文输入区 */}
           <div
-            className={`flex w-1/2 flex-col border-r border-[var(--vesper-border)] ${dragOver ? 'bg-[#f3f4f6]' : ''}`}
+            data-testid="workbench-pane-input"
+            className={`flex flex-col ${
+              isVertical
+                ? 'min-h-0 flex-1 border-b border-[var(--vesper-border)]'
+                : 'w-1/2 border-r border-[var(--vesper-border)]'
+            } ${dragOver ? 'bg-[#f3f4f6]' : ''}`}
             onDragOver={(e) => {
               e.preventDefault();
               setDragOver(true);
@@ -419,8 +443,11 @@ export default function WorkbenchApp() {
             />
           </div>
 
-          {/* 右：结果 + 命中清单 */}
-          <div className="flex w-1/2 min-w-0 flex-col">
+          {/* 脱敏结果 + 命中清单 */}
+          <div
+            data-testid="workbench-pane-output"
+            className={`flex min-w-0 flex-col ${isVertical ? 'min-h-0 flex-1' : 'w-1/2'}`}
+          >
             <div className="flex items-center gap-2 px-3 py-2 text-xs text-[var(--vesper-text-dim)]">
               <span>{t.workbench.result}</span>
               {pending && <span>{t.workbench.processing}</span>}
@@ -441,7 +468,11 @@ export default function WorkbenchApp() {
               {highlighted}
             </div>
             {hitGroups.length > 0 && (
-              <div className="max-h-36 overflow-auto border-t border-[var(--vesper-border)] px-3 py-2">
+              <div
+                className={`${
+                  isVertical ? 'max-h-24' : 'max-h-36'
+                } overflow-auto border-t border-[var(--vesper-border)] px-3 py-2`}
+              >
                 <div className="mb-1 text-xs text-[var(--vesper-text-dim)]">
                   {t.workbench.hitList}
                 </div>
@@ -463,14 +494,25 @@ export default function WorkbenchApp() {
         </div>
       ) : (
         /* 还原模式（4.7） */
-        <div className="flex min-h-0 flex-1">
+        <div
+          data-testid="workbench-split"
+          className={`flex min-h-0 flex-1 ${isVertical ? 'flex-col' : 'flex-row'}`}
+        >
           <textarea
-            className="w-1/2 resize-none border-r border-[var(--vesper-border)] bg-transparent p-3 font-mono text-sm outline-none"
+            data-testid="workbench-pane-input"
+            className={`resize-none bg-transparent p-3 font-mono text-sm outline-none ${
+              isVertical
+                ? 'min-h-0 w-full flex-1 border-b border-[var(--vesper-border)]'
+                : 'w-1/2 border-r border-[var(--vesper-border)]'
+            }`}
             value={restoreInput}
             onChange={(e) => setRestoreInput(e.target.value)}
             placeholder={t.workbench.restorePlaceholder}
           />
-          <div className="flex w-1/2 flex-col">
+          <div
+            data-testid="workbench-pane-output"
+            className={`flex min-w-0 flex-col ${isVertical ? 'min-h-0 flex-1' : 'w-1/2'}`}
+          >
             <div className="flex items-center gap-2 px-3 py-2 text-xs text-[var(--vesper-text-dim)]">
               <span>
                 {mappingSize > 0 ? t.workbench.mappingCount(mappingSize) : t.workbench.restoreEmpty}
@@ -501,7 +543,7 @@ export default function WorkbenchApp() {
       )}
 
       {/* 底部状态条 */}
-      <footer className="flex items-center gap-4 border-t border-[var(--vesper-border)] px-4 py-1.5 text-xs text-[var(--vesper-text-dim)]">
+      <footer className="flex flex-wrap items-center gap-x-4 gap-y-1 border-t border-[var(--vesper-border)] px-4 py-1.5 text-xs text-[var(--vesper-text-dim)]">
         {mode === 'desensitize' ? (
           <>
             <span>

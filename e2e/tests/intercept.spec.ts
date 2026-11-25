@@ -301,6 +301,37 @@ test.describe('粘贴拦截全链路（真实构建产物 + chrome API 桩）', 
     await expect(page.getByText(/VESPER 已脱敏 1 处/)).toBeVisible();
     expect(await page.evaluate(() => navigator.clipboard.readText())).toBe('联系星辰科技\n第二行');
   });
+
+  test('preview 模式点击「脱敏粘贴」时拦截站点 paste 内的 clipboard.read/readText，不触发浏览器确认弹窗且不泄露原剪贴板', async ({
+    page,
+  }) => {
+    await setup(page, 'preview');
+    // 撤销 clipboard-read 授权以还原真实网页默认状态（仅保留测试写入剪贴板所需的 clipboard-write）
+    await page.context().clearPermissions();
+    await page.context().grantPermissions(['clipboard-write']);
+
+    const editor = page.locator('#ce');
+    await editor.evaluate((el) => {
+      el.addEventListener('paste', async (e) => {
+        e.preventDefault();
+        const textFromApi = await navigator.clipboard.readText();
+        const items = await navigator.clipboard.read();
+        const blob = await items[0]!.getType('text/plain');
+        const itemText = await blob.text();
+        el.setAttribute('data-read-text', textFromApi);
+        el.setAttribute('data-read-item', itemText);
+        el.textContent = textFromApi;
+      });
+    });
+
+    await pasteInto(page, '#ce', '星辰科技\n联系 zhangsan@acme.com');
+    await expect(page.getByText(/检测到 2 处敏感信息/)).toBeVisible();
+    await page.locator('[data-act="confirm"]').click();
+
+    await expect(editor).toHaveText('公司A\n联系 [EMAIL_1]');
+    await expect(editor).toHaveAttribute('data-read-text', '公司A\n联系 [EMAIL_1]');
+    await expect(editor).toHaveAttribute('data-read-item', '公司A\n联系 [EMAIL_1]');
+  });
 });
 
 test.describe('富文本分批回填', () => {

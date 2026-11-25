@@ -17,17 +17,118 @@ import {
   getSchemes,
   getSettings,
   getSites,
+  getUpdateState,
   hostMatches,
   hostToOrigins,
   incrementDailyCount,
   pushMapping,
+  saveUpdateState,
   updateSettings,
   urlToHost,
 } from '@/src/storage';
 import type { SiteStateResponse } from '@/src/messages';
 import { genId } from '@/src/core/presets';
 import { restore } from '@/src/core/restore';
+import {
+  GITHUB_LATEST_API_URL,
+  parseGithubReleasePayload,
+  type UpdateState,
+} from '@/src/core/update';
 import { VESPER_LOGO_PATHS, VESPER_LOGO_VIEWBOX } from '@/src/brand';
+
+const UPDATE_ALARM_NAME = 'vesper-check-update';
+const UPDATE_CHECK_INTERVAL_MINUTES = 12 * 60; // 12 小时定期检查
+const UPDATE_CHECK_INTERVAL_MS = UPDATE_CHECK_INTERVAL_MINUTES * 60 * 1000;
+let checkingUpdate: Promise<UpdateState> | undefined;
+
+async function doCheckForUpdates(): Promise<UpdateState> {
+  const previous = await getUpdateState();
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 10_000);
+  try {
+    const resp = await fetch(GITHUB_LATEST_API_URL, {
+      method: 'GET',
+      credentials: 'omit',
+      cache: 'no-store',
+      headers: { Accept: 'application/vnd.github+json' },
+      signal: controller.signal,
+    });
+    if (resp.status === 404) {
+      const next: UpdateState = { checkedAt: Date.now() };
+      await saveUpdateState(next);
+      return next;
+    }
+    if (!resp.ok) {
+      throw new Error(`HTTP ${resp.status}`);
+    }
+    const data: unknown = await resp.json();
+    const parsed = parseGithubReleasePayload(data, Date.now());
+    // 若本次解析异常但此前已有有效版本缓存，保留最新已知版本供红点判断
+    const next: UpdateState = parsed.lastError
+      ? {
+          ...previous,
+          checkedAt: parsed.checkedAt,
+          lastError: parsed.lastError,
+        }
+      : parsed;
+    await saveUpdateState(next);
+    return next;
+  } catch (err) {
+    const message =
+      err instanceof Error && err.name === 'AbortError'
+        ? '连接超时'
+        : err instanceof Error
+          ? err.message
+          : '网络请求失败';
+    const next: UpdateState = {
+      ...previous,
+      checkedAt: previous?.checkedAt ?? 0,
+      lastError: message,
+    };
+    await saveUpdateState(next);
+    return next;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function checkForUpdates(force = false): Promise<UpdateState> {
+  if (!force && !checkingUpdate) {
+    const cached = await getUpdateState();
+    if (cached?.checkedAt && Date.now() - cached.checkedAt < UPDATE_CHECK_INTERVAL_MS) {
+      return cached;
+    }
+  }
+  return (checkingUpdate ??= doCheckForUpdates().finally(() => {
+    checkingUpdate = undefined;
+  }));
+}
+
+let alarmQueue: Promise<void> = Promise.resolve();
+
+function syncUpdateAlarm(): Promise<void> {
+  alarmQueue = alarmQueue.then(doSyncUpdateAlarm).catch(() => {});
+  return alarmQueue;
+}
+
+async function doSyncUpdateAlarm(): Promise<void> {
+  if (!chrome.alarms) return;
+  const settings = await getSettings();
+  const enabled = settings?.autoCheckUpdate ?? true;
+  if (!enabled) {
+    await chrome.alarms.clear(UPDATE_ALARM_NAME);
+    return;
+  }
+  const existing = await chrome.alarms.get(UPDATE_ALARM_NAME);
+  if (!existing) {
+    const state = await getUpdateState();
+    const overdue = !state?.checkedAt || Date.now() - state.checkedAt >= UPDATE_CHECK_INTERVAL_MS;
+    await chrome.alarms.create(UPDATE_ALARM_NAME, {
+      delayInMinutes: overdue ? 1 : UPDATE_CHECK_INTERVAL_MINUTES,
+      periodInMinutes: UPDATE_CHECK_INTERVAL_MINUTES,
+    });
+  }
+}
 
 const ENGINE_PAGE = '/engine.html';
 let openingEngine: Promise<void> | undefined;
@@ -77,6 +178,139 @@ async function openWorkbench(): Promise<void> {
     // 降级新建标签页
   }
   await chrome.tabs.create({ url });
+}
+
+const SIDEBAR_FALLBACK_WIDTH = 420;
+const SIDEBAR_FALLBACK_HEIGHT = 760;
+const FALLBACK_WINDOW_KEY = 'vesper:fallbackWindowId';
+const NATIVE_SIDEPANEL_BROKEN_KEY = 'vesper:nativeSidePanelBroken';
+const IS_ARC_KEY = 'vesper:isArc';
+let openingFallback: Promise<void> | undefined;
+
+async function isNativeSidePanelBypassed(): Promise<boolean> {
+  const [localData, sessionData] = await Promise.all([
+    chrome.storage.local.get(IS_ARC_KEY).catch(() => ({}) as Record<string, unknown>),
+    chrome.storage.session
+      .get(NATIVE_SIDEPANEL_BROKEN_KEY)
+      .catch(() => ({}) as Record<string, unknown>),
+  ]);
+  return Boolean(localData[IS_ARC_KEY] || sessionData[NATIVE_SIDEPANEL_BROKEN_KEY]);
+}
+
+/**
+ * 侧边栏独立窗口兜底（用于 Arc 等不支持原生 sidePanel 或创建无界面幽灵 SIDE_PANEL 的浏览器）。
+ * 使用 ?mode=window 区分原生宿主，贴靠当前浏览器窗口右侧边缘打开紧凑型 popup 窗口。
+ */
+function openSidePanelFallbackWindow(preferredWindowId?: number): Promise<void> {
+  return (openingFallback ??= (async () => {
+    const url = `${chrome.runtime.getURL('/sidepanel.html')}?mode=window`;
+
+    // 优先聚焦已打开且真实存活的独立侧边栏窗口（不盲目用 tabs.query 以免误中幽灵视图）
+    const sessionObj = await chrome.storage.session
+      .get(FALLBACK_WINDOW_KEY)
+      .catch(() => ({}) as Record<string, unknown>);
+    const savedWinId = sessionObj[FALLBACK_WINDOW_KEY];
+    if (typeof savedWinId === 'number') {
+      const existingWin = await chrome.windows
+        .get(savedWinId, { populate: true })
+        .catch(() => null);
+      if (existingWin?.id != null && (existingWin.tabs?.length ?? 0) > 0) {
+        await chrome.windows
+          .update(existingWin.id, {
+            focused: true,
+            ...(existingWin.state === 'minimized' ? { state: 'normal' } : {}),
+          })
+          .catch(() => {});
+        return;
+      }
+      await chrome.storage.session.remove(FALLBACK_WINDOW_KEY).catch(() => {});
+    }
+
+    let bounds: { left?: number; top?: number; height: number } = {
+      height: SIDEBAR_FALLBACK_HEIGHT,
+    };
+    try {
+      const refWin =
+        preferredWindowId != null
+          ? await chrome.windows.get(preferredWindowId)
+          : await chrome.windows.getLastFocused({ windowTypes: ['normal'] });
+      if (refWin && refWin.state !== 'fullscreen' && refWin.state !== 'minimized') {
+        const winWidth = Math.round(refWin.width ?? 1200);
+        const winHeight = Math.max(480, Math.round(refWin.height ?? SIDEBAR_FALLBACK_HEIGHT));
+        const winLeft = Math.round(refWin.left ?? 0);
+        const winTop = Math.round(refWin.top ?? 40);
+        bounds = {
+          left: winLeft + Math.max(0, winWidth - SIDEBAR_FALLBACK_WIDTH),
+          top: winTop,
+          height: winHeight,
+        };
+      }
+    } catch {
+      // 忽略宿主窗口几何信息读取失败，使用默认尺寸
+    }
+
+    let created: chrome.windows.Window | undefined;
+    try {
+      created = await chrome.windows.create({
+        url,
+        type: 'popup',
+        width: SIDEBAR_FALLBACK_WIDTH,
+        ...bounds,
+        focused: true,
+      });
+    } catch {
+      try {
+        created = await chrome.windows.create({
+          url,
+          type: 'popup',
+          width: SIDEBAR_FALLBACK_WIDTH,
+          height: SIDEBAR_FALLBACK_HEIGHT,
+          focused: true,
+        });
+      } catch {
+        await chrome.tabs.create({ url, active: true });
+        return;
+      }
+    }
+
+    if (created?.id != null) {
+      await chrome.storage.session.set({ [FALLBACK_WINDOW_KEY]: created.id }).catch(() => {});
+    }
+  })().finally(() => {
+    openingFallback = undefined;
+  }));
+}
+
+async function pingNativeSidePanel(): Promise<{ visible: boolean; isArc?: boolean } | null> {
+  try {
+    const res = (await chrome.runtime.sendMessage({ type: 'PING_NATIVE_SIDE_PANEL' })) as
+      { visible?: boolean; isArc?: boolean } | undefined;
+    if (!res || typeof res.visible !== 'boolean') return null;
+    return { visible: res.visible, isArc: res.isArc };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * 核验原生 sidePanel 是否真实可见：
+ * 在 Arc 中，chrome.sidePanel.open 可能静默挂起，或在内存中创建未挂载到任何原生视图的隐藏
+ * SIDE_PANEL WebContents（此时 getContexts 仍返回非空，但页面不可见/未触发渲染帧）。
+ * 通过主动向原生侧边栏视图发起可见性与渲染帧探活，未通过则自动标记并拉起独立侧边栏窗口。
+ */
+async function verifySidePanelOrFallback(preferredWindowId?: number): Promise<void> {
+  if (await isNativeSidePanelBypassed()) {
+    await openSidePanelFallbackWindow(preferredWindowId);
+    return;
+  }
+  for (const waitMs of [80, 160, 220]) {
+    await new Promise((r) => setTimeout(r, waitMs));
+    const pong = await pingNativeSidePanel();
+    if (pong?.visible) return;
+    if (pong?.isArc) break;
+  }
+  await chrome.storage.session.set({ [NATIVE_SIDEPANEL_BROKEN_KEY]: true }).catch(() => {});
+  await openSidePanelFallbackWindow(preferredWindowId);
 }
 
 /**
@@ -160,6 +394,7 @@ let menuQueue: Promise<void> = Promise.resolve();
 function createMenusOnce(): Promise<void> {
   const items: chrome.contextMenus.CreateProperties[] = [
     { id: 'vesper-open-workbench', title: '打开 VESPER 工作台', contexts: ['action', 'page'] },
+    { id: 'vesper-open-sidepanel', title: '打开 VESPER 侧边栏', contexts: ['action', 'page'] },
     {
       id: 'vesper-desensitize-selection',
       title: '用 VESPER 脱敏选中文本',
@@ -229,20 +464,34 @@ async function doSyncRegistrations(): Promise<void> {
   const permitted = await Promise.all(
     candidates.map(async ({ id, matches }) => {
       const granted = await chrome.permissions.contains({ origins: matches }).catch(() => false);
-      return granted
-        ? { id, matches, js: ['content-scripts/content.js'], runAt: 'document_start' as const }
-        : null;
+      if (!granted) return [];
+      return [
+        {
+          id,
+          matches,
+          js: ['content-scripts/content.js'],
+          runAt: 'document_start' as const,
+          world: 'ISOLATED' as const,
+        },
+        {
+          id: `${id}-main`,
+          matches,
+          js: ['content-scripts/clipboard-guard.js'],
+          runAt: 'document_start' as const,
+          world: 'MAIN' as const,
+        },
+      ];
     }),
   );
-  const desired = new Map(
-    permitted.flatMap((script) => (script ? [[script.id, script] as const] : [])),
-  );
+  const desired = new Map(permitted.flat().map((script) => [script.id, script] as const));
   const removed: string[] = [];
   for (const script of existing) {
     if (!script.id.startsWith('vesper-')) continue;
     const next = desired.get(script.id);
     if (
       next &&
+      (script.world ?? 'ISOLATED') === next.world &&
+      script.js?.[0] === next.js[0] &&
       next.matches.length === script.matches?.length &&
       next.matches.every((pattern) => script.matches!.includes(pattern))
     ) {
@@ -260,16 +509,39 @@ async function doSyncRegistrations(): Promise<void> {
 }
 
 export default defineBackground(() => {
+  void chrome.sidePanel?.setOptions?.({ path: 'sidepanel.html', enabled: true }).catch(() => {});
   const ready = ensureSeeded();
-  void ready.then(syncContentScriptRegistrations).catch(() => console.warn('[VESPER] 初始化失败'));
+  void ready
+    .then(() => Promise.all([syncContentScriptRegistrations(), syncUpdateAlarm()]))
+    .catch(() => console.warn('[VESPER] 初始化失败'));
 
   chrome.runtime.onInstalled.addListener(() => {
     // 右键菜单：打开工作台 + 选中即脱敏（文档 T7）
     void setupContextMenus();
+    void ready.then(syncUpdateAlarm).catch(() => {});
   });
 
-  // 浏览器启动时补一次菜单（开发重载/异常清理后菜单可能缺失，创建是幂等的）
-  chrome.runtime.onStartup.addListener(() => void setupContextMenus());
+  // 浏览器启动时补一次菜单与更新检查定时器
+  chrome.runtime.onStartup.addListener(() => {
+    void setupContextMenus();
+    void ready.then(syncUpdateAlarm).catch(() => {});
+  });
+
+  chrome.alarms?.onAlarm.addListener((alarm) => {
+    if (alarm.name !== UPDATE_ALARM_NAME) return;
+    void (async () => {
+      await ready;
+      if ((await getSettings())?.autoCheckUpdate ?? true) {
+        await checkForUpdates(false);
+      }
+    })();
+  });
+
+  chrome.storage.onChanged.addListener((changes, area) => {
+    if (area === 'local' && changes['vesper:settings']) {
+      void syncUpdateAlarm();
+    }
+  });
 
   // 快捷键 open-workbench（manifest commands）
   chrome.commands.onCommand.addListener((command) => {
@@ -279,6 +551,26 @@ export default defineBackground(() => {
   chrome.contextMenus.onClicked.addListener((info, tab) => {
     if (info.menuItemId === 'vesper-open-workbench') {
       void openWorkbench();
+    } else if (info.menuItemId === 'vesper-open-sidepanel') {
+      const targetWindowId = tab?.windowId;
+      const targetTabId = tab?.id;
+      let openPromise: Promise<void> | undefined;
+      if (chrome.sidePanel?.open && (targetWindowId != null || targetTabId != null)) {
+        try {
+          openPromise =
+            targetWindowId != null
+              ? chrome.sidePanel.open({ windowId: targetWindowId })
+              : chrome.sidePanel.open({ tabId: targetTabId! });
+        } catch {
+          openPromise = undefined;
+        }
+      }
+      if (openPromise) {
+        void verifySidePanelOrFallback(targetWindowId);
+        void openPromise.catch(() => openSidePanelFallbackWindow(targetWindowId));
+      } else {
+        void openSidePanelFallbackWindow(targetWindowId);
+      }
     } else if (info.menuItemId === 'vesper-desensitize-selection' && info.selectionText) {
       // 选中文本暂存 session，工作台打开后自动读取（关闭即销毁）
       void chrome.storage.session
@@ -297,7 +589,8 @@ export default defineBackground(() => {
   chrome.permissions.onRemoved.addListener(onPermissionChange);
 
   // 消息路由
-  chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+  chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+    if (msg?.type === 'PING_NATIVE_SIDE_PANEL') return false;
     void (async () => {
       await ready;
       switch (msg?.type) {
@@ -344,6 +637,15 @@ export default defineBackground(() => {
               } satisfies SiteStateResponse;
             }
             // 全局模式无具体站点，构造虚拟站点（拦截模式跟随用户配置）；scheme 用当前方案
+            if (sender.tab?.id != null) {
+              void chrome.scripting
+                .executeScript({
+                  target: { tabId: sender.tab.id, frameIds: [sender.frameId ?? 0] },
+                  files: ['content-scripts/clipboard-guard.js'],
+                  world: 'MAIN',
+                })
+                .catch(() => {});
+            }
             return {
               status: 'enabled',
               site: {
@@ -379,6 +681,15 @@ export default defineBackground(() => {
               ...(scheme ? { scheme } : {}),
             } satisfies SiteStateResponse;
           }
+          if (sender.tab?.id != null) {
+            void chrome.scripting
+              .executeScript({
+                target: { tabId: sender.tab.id, frameIds: [sender.frameId ?? 0] },
+                files: ['content-scripts/clipboard-guard.js'],
+                world: 'MAIN',
+              })
+              .catch(() => {});
+          }
           return { status: 'enabled', site, scheme } satisfies SiteStateResponse;
         }
         case 'INCREMENT_COUNT':
@@ -399,8 +710,16 @@ export default defineBackground(() => {
         case 'ENSURE_ENGINE':
           await ensureEnginePage();
           return true;
+        case 'CHECK_UPDATE':
+          return await checkForUpdates(Boolean(msg.force));
         case 'OPEN_WORKBENCH':
           await openWorkbench();
+          return;
+        case 'OPEN_SIDE_PANEL_FALLBACK':
+          await openSidePanelFallbackWindow(msg.windowId);
+          return;
+        case 'VERIFY_SIDE_PANEL_OPENED':
+          void verifySidePanelOrFallback(msg.windowId);
           return;
         default:
           return;

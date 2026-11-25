@@ -16,6 +16,7 @@ import {
 import type { Scheme, SiteCategory, SiteMode, SiteRule, SiteScope } from '../../core/types';
 import { sendMessage } from '../../messages';
 import {
+  ensureSeeded,
   getRemovableOrigins,
   getSchemes,
   getSites,
@@ -105,12 +106,11 @@ export default function SitesTab() {
   const [sites, setSites] = useState<SiteRule[]>([]);
   const [schemes, setSchemes] = useState<Scheme[]>([]);
   const [scope, setScope] = useState<SiteScope>('list');
-  const [excludeHosts, setExcludeHosts] = useState<string[]>([]);
-  /** 例外文本框的编辑态（不回写用户输入，避免打字时被规范化打断） */
+  /** 例外文本框的编辑态与已保存基线（未保存时保存按钮显示黑色，保存后变为灰色） */
   const [excludeText, setExcludeText] = useState('');
-  const excludeTimer = useRef<number | null>(null);
-  const excludeTextRef = useRef('');
-  const excludeHostsRef = useRef<string[]>([]);
+  const [savedExcludeText, setSavedExcludeText] = useState('');
+  const [savingExclude, setSavingExclude] = useState(false);
+  const [excludeJustSaved, setExcludeJustSaved] = useState(false);
   const siteSaveTimer = useRef<number | null>(null);
   const sitesRef = useRef<SiteRule[]>([]);
   const [globalGranted, setGlobalGranted] = useState(false);
@@ -131,32 +131,26 @@ export default function SitesTab() {
   });
 
   sitesRef.current = sites;
-  excludeTextRef.current = excludeText;
-  excludeHostsRef.current = excludeHosts;
+  const excludeDirty = excludeText !== savedExcludeText;
 
   useEffect(() => {
-    void Promise.all([getSites(), getSchemes(), getSettings()]).then(([s, sch, st]) => {
-      setSites(s);
-      setSchemes(sch);
-      setScope(st?.siteScope ?? 'list');
-      setGlobalMode(st?.globalMode ?? 'preview');
-      const exclude = st?.excludeHosts ?? DEFAULT_EXCLUDE_HOSTS;
-      setExcludeHosts(exclude);
-      setExcludeText(exclude.join('\n'));
-    });
+    void ensureSeeded()
+      .then(() => Promise.all([getSites(), getSchemes(), getSettings()]))
+      .then(([s, sch, st]) => {
+        setSites(s);
+        setSchemes(sch);
+        setScope(st?.siteScope ?? 'list');
+        setGlobalMode(st?.globalMode ?? 'preview');
+        const exclude = st?.excludeHosts ?? DEFAULT_EXCLUDE_HOSTS;
+        const joined = exclude.join('\n');
+        setExcludeText(joined);
+        setSavedExcludeText(joined);
+      });
   }, []);
 
-  // 卸载时落盘挂起的防抖编辑（例外主机与站点文本字段），避免切 Tab 丢失
+  // 卸载时落盘挂起的站点文本字段防抖编辑，避免切 Tab 丢失
   useEffect(() => {
     return () => {
-      if (excludeTimer.current != null) {
-        window.clearTimeout(excludeTimer.current);
-        excludeTimer.current = null;
-        const next = parseExcludeText(excludeTextRef.current);
-        if (next.join('\n') !== excludeHostsRef.current.join('\n')) {
-          void updateSettings({ excludeHosts: next });
-        }
-      }
       if (siteSaveTimer.current != null) {
         window.clearTimeout(siteSaveTimer.current);
         siteSaveTimer.current = null;
@@ -258,35 +252,26 @@ export default function SitesTab() {
     await persistScope('global');
   }
 
-  async function persistExcludeHosts(next: string[]) {
-    setExcludeHosts(next);
-    await updateSettings({ excludeHosts: next });
-    // 保存后 content script 会因 storage 变更自动刷新判定，无需再注册
+  async function onSaveExcludeHosts() {
+    if (!excludeDirty || savingExclude) return;
+    setSavingExclude(true);
+    try {
+      const next = parseExcludeText(excludeText);
+      // 保存后 content script 会因 storage 变更自动刷新判定，无需再注册
+      await updateSettings({ excludeHosts: next });
+      const normalized = next.join('\n');
+      setExcludeText(normalized);
+      setSavedExcludeText(normalized);
+      setExcludeJustSaved(true);
+    } finally {
+      setSavingExclude(false);
+    }
   }
 
   /** 全局模式拦截模式变更：写入 settings，content script 监听 storage 变化自动刷新 */
   async function persistGlobalMode(next: SiteMode) {
     setGlobalMode(next);
     await updateSettings({ globalMode: next });
-  }
-
-  /** 停止输入 500ms 后落盘；失焦时立即落盘 */
-  function scheduleExcludeCommit(text: string) {
-    if (excludeTimer.current != null) window.clearTimeout(excludeTimer.current);
-    excludeTimer.current = window.setTimeout(() => {
-      excludeTimer.current = null;
-      void persistExcludeHosts(parseExcludeText(text));
-    }, 500);
-  }
-
-  function commitExcludeText(text: string) {
-    if (excludeTimer.current != null) {
-      window.clearTimeout(excludeTimer.current);
-      excludeTimer.current = null;
-    }
-    const next = parseExcludeText(text);
-    if (next.join('\n') === excludeHosts.join('\n')) return;
-    void persistExcludeHosts(next);
   }
 
   /** 单个站点启停（状态列点击）：启用申请权限，停用按引用计数安全交还权限 */
@@ -664,16 +649,42 @@ export default function SitesTab() {
               {t.options.excludeListTip}
             </p>
             <textarea
+              data-testid="exclude-hosts-textarea"
               className="h-44 w-full resize-y rounded-md border border-[var(--vesper-border)] bg-white px-3 py-2 font-mono text-xs leading-5 outline-none focus:border-black"
               value={excludeText}
               onChange={(e) => {
                 setExcludeText(e.target.value);
-                scheduleExcludeCommit(e.target.value);
+                if (excludeJustSaved) setExcludeJustSaved(false);
               }}
-              onBlur={() => commitExcludeText(excludeText)}
+              onKeyDown={(e) => {
+                if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 's') {
+                  e.preventDefault();
+                  void onSaveExcludeHosts();
+                }
+              }}
               spellCheck={false}
               placeholder={t.options.excludeEmpty}
             />
+            <div className="mt-2.5 flex items-center gap-3">
+              <button
+                type="button"
+                data-testid="save-exclude-hosts"
+                disabled={!excludeDirty || savingExclude}
+                onClick={() => void onSaveExcludeHosts()}
+                className={`rounded-md px-4 py-1.5 text-xs font-medium transition-colors ${
+                  excludeDirty
+                    ? 'cursor-pointer bg-black text-white hover:bg-neutral-800'
+                    : 'cursor-not-allowed bg-neutral-200 text-neutral-500'
+                }`}
+              >
+                {t.common.save}
+              </button>
+              {excludeJustSaved && !excludeDirty && (
+                <span className="text-xs text-[var(--vesper-text-dim)]">
+                  {t.options.excludeSaved}
+                </span>
+              )}
+            </div>
           </div>
         </section>
       ) : (

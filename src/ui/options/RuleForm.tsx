@@ -205,7 +205,18 @@ export default function RuleForm({ rule, onChange, showTest = true }: Props) {
           <select
             className="w-full rounded-md border border-[var(--vesper-border)] bg-white px-2.5 py-1.5 text-xs outline-none focus:border-black"
             value={rule.mode}
-            onChange={(e) => update({ mode: e.target.value as Rule['mode'] })}
+            onChange={(e) => {
+              const nextMode = e.target.value as Rule['mode'];
+              const numberedDefault = detector?.defaultReplacement ?? '[MASKED_n]';
+              const fixedDefault = numberedDefault.replace(/_n(?=\]|$)/, '');
+              let replacement = rule.replacement;
+              if (nextMode === 'fixed' && replacement === numberedDefault) {
+                replacement = fixedDefault;
+              } else if (nextMode === 'numbered' && replacement === fixedDefault) {
+                replacement = numberedDefault;
+              }
+              update({ mode: nextMode, replacement });
+            }}
           >
             <option value="fixed">{t.options.modeFixed}</option>
             <option value="numbered">{t.options.modeNumbered}</option>

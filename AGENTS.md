@@ -27,4 +27,4 @@ Recent commits follow `type(scope): summary`, such as `fix(content): ...`, `feat
 
 ## Security & Configuration
 
-VESPER processes text locally. Preserve this privacy model: do not add network transmission, analytics, cookie access, or `chrome.storage.sync`. Keep host access optional and request site permissions only through the existing site configuration flow.
+VESPER processes all user text and rules locally. Preserve this privacy model: do not transmit user text or rules over the network, and do not add analytics, cookie access, or `chrome.storage.sync` (the only permitted network request is the credential-free GitHub Releases update check, which can be toggled in Settings). Keep host access optional and request site permissions only through the existing site configuration flow.

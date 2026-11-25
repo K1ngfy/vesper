@@ -3,6 +3,7 @@
  * content script 不直接读 storage 中的敏感数据，一律经 background 路由。
  */
 import type { Scheme, SiteRule } from './core/types';
+import type { UpdateState } from './core/update';
 
 export const ENGINE_PORT = 'vesper-engine';
 
@@ -16,7 +17,11 @@ export type Message =
   | { type: 'RECORD_MAPPING'; schemeId: string; mapping: Record<string, string> }
   | { type: 'REFRESH_SITE_REGISTRATIONS' }
   | { type: 'ENSURE_ENGINE' }
-  | { type: 'OPEN_WORKBENCH' };
+  | { type: 'CHECK_UPDATE'; force?: boolean }
+  | { type: 'OPEN_WORKBENCH' }
+  | { type: 'OPEN_SIDE_PANEL_FALLBACK'; windowId?: number }
+  | { type: 'VERIFY_SIDE_PANEL_OPENED'; windowId?: number }
+  | { type: 'PING_NATIVE_SIDE_PANEL' };
 
 export type SiteStatus = 'enabled' | 'unconfigured' | 'no-permission' | 'disabled';
 
@@ -34,9 +39,13 @@ export type MessageResponse<M extends Message> = M extends { type: 'GET_ACTIVE_S
       ? SiteStateResponse
       : M extends { type: 'ENSURE_ENGINE' }
         ? boolean
-        : M extends { type: 'INCREMENT_COUNT' } | { type: 'GET_DAILY_COUNT' }
-          ? number
-          : void;
+        : M extends { type: 'CHECK_UPDATE' }
+          ? UpdateState
+          : M extends { type: 'PING_NATIVE_SIDE_PANEL' }
+            ? { visible: boolean; isArc?: boolean }
+            : M extends { type: 'INCREMENT_COUNT' } | { type: 'GET_DAILY_COUNT' }
+              ? number
+              : void;
 
 export async function sendMessage<M extends Message>(msg: M): Promise<MessageResponse<M>> {
   return (await chrome.runtime.sendMessage(msg)) as MessageResponse<M>;

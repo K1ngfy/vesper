@@ -9,13 +9,14 @@ import Toggle from '../Toggle';
 
 /** 规则列表网格列宽：顺序 / 类型 / 名称 / 匹配与替换 / 替换方式 / 状态 / 操作 */
 export const RULE_ROW_COLS =
-  'grid-cols-[54px_56px_minmax(110px,0.85fr)_minmax(220px,2.1fr)_84px_54px_68px]';
+  'grid-cols-[54px_56px_minmax(110px,0.85fr)_minmax(200px,2.1fr)_104px_54px_68px]';
 
 interface Props {
   rule: Rule;
   order: number;
   isDragOver?: boolean;
   onToggle: (enabled: boolean) => void;
+  onModeChange: (mode: Rule['mode']) => void;
   onEdit: () => void;
   onDelete: () => void;
   onDragStart: () => void;
@@ -94,6 +95,7 @@ function getReplacementSummary(rule: Rule): string {
     return `${t.options.modeMask}(${t.options.maskHead}${head}·${t.options.maskTail}${tail}${rule.maskKeepDomain ? '·留域名' : ''})`;
   }
   if (rule.replacement) return rule.replacement;
+  if (rule.mode === 'fixed') return '（空）';
   if (rule.type === 'builtin') {
     return getDetector(rule.pattern)?.defaultReplacement ?? '[MASKED_n]';
   }
@@ -114,6 +116,7 @@ export default function RuleCard({
   order,
   isDragOver = false,
   onToggle,
+  onModeChange,
   onEdit,
   onDelete,
   onDragStart,
@@ -201,8 +204,27 @@ export default function RuleCard({
         )}
       </div>
 
-      {/* 替换方式 */}
-      <div className="text-xs text-[var(--vesper-text-dim)]">{MODE_LABEL[rule.mode]}</div>
+      {/* 替换方式（可直接下拉切换，无需打开编辑弹窗） */}
+      <div>
+        <select
+          aria-label={t.options.ruleColMode}
+          value={rule.mode}
+          draggable={false}
+          onMouseDown={(e) => e.stopPropagation()}
+          onDragStart={(e) => {
+            e.preventDefault();
+            e.stopPropagation();
+          }}
+          onChange={(e) => onModeChange(e.target.value as Rule['mode'])}
+          className="w-full cursor-pointer rounded border border-[var(--vesper-border)] bg-white px-1.5 py-1 text-xs text-neutral-800 outline-none hover:border-neutral-400 focus:border-black"
+        >
+          {(Object.keys(MODE_LABEL) as Rule['mode'][]).map((m) => (
+            <option key={m} value={m}>
+              {MODE_LABEL[m]}
+            </option>
+          ))}
+        </select>
+      </div>
 
       {/* 启停开关 */}
       <div className="flex items-center">

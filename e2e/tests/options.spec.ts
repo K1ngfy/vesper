@@ -197,3 +197,126 @@ test('站点拦截：批量绑定方案可正确切回「跟随当前方案」',
   await page.getByLabel('绑定方案').selectOption({ label: '跟随当前方案' });
   await expect(firstSiteRow.locator('select').first()).toHaveValue('');
 });
+
+test('方案管理：无需打开编辑弹窗即可直接下拉切换规则替换方式', async ({ extCtx, extensionId }) => {
+  const page = await openOptions(extCtx, extensionId);
+  const emailRow = page.locator('[draggable="true"]', { hasText: '邮箱' }).first();
+  const modeSelect = emailRow.getByLabel('替换方式');
+  await expect(modeSelect).toHaveValue('numbered');
+  await expect(emailRow).toContainText('[EMAIL_n]');
+
+  // 直接在列表行内切换为「固定替换」，摘要同步从 [EMAIL_n] 变为 [EMAIL]
+  await modeSelect.selectOption('fixed');
+  await expect(modeSelect).toHaveValue('fixed');
+  await expect(emailRow).toContainText('[EMAIL]');
+  await expect(emailRow).not.toContainText('[EMAIL_n]');
+
+  // 直接切换为「掩码」，摘要同步变为掩码格式，刷新页面后仍持久化生效
+  await modeSelect.selectOption('mask');
+  await expect(emailRow).toContainText('掩码(留首1·留尾1)');
+  await page.reload();
+  const reloadedEmailRow = page.locator('[draggable="true"]', { hasText: '邮箱' }).first();
+  await expect(reloadedEmailRow.getByLabel('替换方式')).toHaveValue('mask');
+});
+
+test('版本更新提示：存在新版本时配置页顶部 Tab 与 Popup 配置入口显示红点', async ({
+  extCtx,
+  extensionId,
+}) => {
+  const page = await openOptions(extCtx, extensionId);
+  await expect(page.getByTestId('options-update-dot')).toHaveCount(0);
+
+  // 模拟检测到 GitHub Release 新版本 v99.0.0
+  await page.evaluate(() =>
+    chrome.storage.local.set({
+      'vesper:update': {
+        checkedAt: Date.now(),
+        latestVersion: '99.0.0',
+        releaseUrl: 'https://github.com/K1ngfy/vesper/releases/tag/v99.0.0',
+      },
+    }),
+  );
+
+  // 配置页顶部「设置与数据」Tab 实时出现红点，点进可见下载横幅
+  await expect(page.getByTestId('options-update-dot')).toBeVisible();
+  await page.getByRole('button', { name: /设置与数据/ }).click();
+  await expect(page.getByTestId('update-available-banner')).toContainText('发现新版本 v99.0.0');
+
+  // Popup「配置」入口同步显示红点
+  const popup = await extCtx.newPage();
+  await popup.goto(`chrome-extension://${extensionId}/popup.html`);
+  await expect(popup.getByTestId('popup-update-dot')).toBeVisible();
+
+  // 当远端版本不高于当前版本时，红点自动熄灭
+  await page.evaluate(() =>
+    chrome.storage.local.set({
+      'vesper:update': {
+        checkedAt: Date.now(),
+        latestVersion: '0.0.1',
+      },
+    }),
+  );
+  await expect(page.getByTestId('options-update-dot')).toHaveCount(0);
+  await expect(popup.getByTestId('popup-update-dot')).toHaveCount(0);
+});
+
+test('全局模式：例外站点修改时保存按钮变黑，点击保存落盘后变灰', async ({
+  extCtx,
+  extensionId,
+}) => {
+  const page = await openOptions(extCtx, extensionId);
+  await page.evaluate(async () => {
+    const res = await chrome.storage.local.get('vesper:settings');
+    const current = res['vesper:settings'] as Record<string, unknown>;
+    await chrome.storage.local.set({
+      'vesper:settings': { ...current, siteScope: 'global' },
+    });
+  });
+  await page.getByText('站点拦截').click();
+
+  const textarea = page.getByTestId('exclude-hosts-textarea');
+  const saveBtn = page.getByTestId('save-exclude-hosts');
+  await expect(textarea).toBeVisible();
+
+  const readBgRgb = () =>
+    saveBtn.evaluate((el) => {
+      const canvas = document.createElement('canvas');
+      canvas.width = 1;
+      canvas.height = 1;
+      const ctx = canvas.getContext('2d')!;
+      ctx.fillStyle = getComputedStyle(el).backgroundColor;
+      ctx.fillRect(0, 0, 1, 1);
+      const [r, g, b] = ctx.getImageData(0, 0, 1, 1).data;
+      return [r, g, b];
+    });
+
+  // 初始已保存态：按钮禁用且为灰色（bg-neutral-200）
+  await expect(saveBtn).toBeDisabled();
+  await expect(saveBtn).toHaveClass(/bg-neutral-200/);
+  await expect.poll(async () => (await readBgRgb())[0]).toBeGreaterThan(200);
+
+  // 编辑例外站点后：未保存状态按钮启用且过渡为纯黑（bg-black -> [0, 0, 0]），尚未落库
+  const initialValue = await textarea.inputValue();
+  await textarea.fill(`${initialValue}\ninternal.corp.example`);
+  await expect(saveBtn).toBeEnabled();
+  await expect(saveBtn).toHaveClass(/bg-black/);
+  await expect.poll(readBgRgb).toEqual([0, 0, 0]);
+  const beforeSave = await page.evaluate(async () => {
+    const res = await chrome.storage.local.get('vesper:settings');
+    return (res['vesper:settings'] as { excludeHosts: string[] }).excludeHosts;
+  });
+  expect(beforeSave).not.toContain('internal.corp.example');
+
+  // 点击保存后：配置落库，按钮恢复灰色禁用状态，并展示「已保存」提示
+  await saveBtn.click();
+  await expect(saveBtn).toBeDisabled();
+  await expect(saveBtn).toHaveClass(/bg-neutral-200/);
+  await expect.poll(async () => (await readBgRgb())[0]).toBeGreaterThan(200);
+  await expect(page.getByText('已保存')).toBeVisible();
+
+  const afterSave = await page.evaluate(async () => {
+    const res = await chrome.storage.local.get('vesper:settings');
+    return (res['vesper:settings'] as { excludeHosts: string[] }).excludeHosts;
+  });
+  expect(afterSave).toContain('internal.corp.example');
+});

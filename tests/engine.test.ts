@@ -2,7 +2,7 @@
  * 引擎单测（VESPEER.md 第 9 节 fixture 必须全过）。
  */
 import { describe, expect, it } from 'vitest';
-import { desensitize, maskValue, testRule } from '../src/core/engine';
+import { applyRuleModeChange, desensitize, maskValue, testRule } from '../src/core/engine';
 import { createRestorer, restore } from '../src/core/restore';
 import { DETECTORS } from '../src/core/detectors';
 import type { BuiltinDetectorId, Rule, Scheme } from '../src/core/types';
@@ -390,6 +390,34 @@ describe('引擎通用行为', () => {
     expect(res.output).toBe(
       '{"password": "[PASSWORD_1]", "api_key": "[SECRET_1]", "Authorization": "Bearer [TOKEN_1]"} 电话 [PHONE_1]',
     );
+  });
+
+  it('applyRuleModeChange 行内切换替换方式时智能同步默认占位符且保留自定义替换词', () => {
+    const email = builtinRule('email'); // numbered, [EMAIL_n]
+    const asFixed = applyRuleModeChange(email, 'fixed');
+    expect(asFixed.mode).toBe('fixed');
+    expect(asFixed.replacement).toBe('[EMAIL]');
+
+    const backToNumbered = applyRuleModeChange(asFixed, 'numbered');
+    expect(backToNumbered.mode).toBe('numbered');
+    expect(backToNumbered.replacement).toBe('[EMAIL_n]');
+
+    // mask 创建的空替换词规则切到 fixed / numbered 自动补全，防止空串误删原文
+    const maskKeyword: Rule = {
+      id: 'k_mask',
+      type: 'keyword',
+      enabled: true,
+      name: '机密词',
+      pattern: '星辰科技',
+      replacement: '',
+      mode: 'mask',
+    };
+    expect(applyRuleModeChange(maskKeyword, 'fixed').replacement).toBe('[MASKED]');
+    expect(applyRuleModeChange(maskKeyword, 'numbered').replacement).toBe('[MASKED_n]');
+
+    // 用户自定义替换文本不被覆盖
+    const custom: Rule = { ...maskKeyword, mode: 'fixed', replacement: '某公司' };
+    expect(applyRuleModeChange(custom, 'numbered').replacement).toBe('某公司');
   });
 
   it('性能基线：100KB 文本 + 默认多规则 < 100ms', () => {

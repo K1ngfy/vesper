@@ -14,6 +14,7 @@ import tailwindcss from '@tailwindcss/vite';
  * - clipboardWrite：insertText 回填失败时把脱敏结果写入剪贴板兜底（文档 4.6 护栏：
  *   任何情况下不让用户丢失文本）。异步 navigator.clipboard.writeText 在 content script
  *   非用户手势上下文会失败，此权限确保剪贴板兜底链可靠。
+ * - alarms：MV3 后台定时唤醒以检查 GitHub Release 新版本（可在设置中关闭）。
  * - optional_host_permissions（全主机通配）：默认按域名逐个申请；
  *   用户主动开启全局模式时可申请全局通配权限整体授权（D5 修订）。
  *
@@ -44,6 +45,7 @@ export default defineConfig({
       'activeTab',
       'clipboardWrite',
       'offscreen',
+      'alarms',
     ],
     optional_host_permissions: ['*://*/*'],
     commands: {

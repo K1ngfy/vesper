@@ -4,9 +4,10 @@
  * - 规则逐条表格式展示，含优先级序号、拖拽排序、快捷启停、弹窗编辑与删除。
  */
 import { useEffect, useMemo, useRef, useState } from 'react';
+import { applyRuleModeChange } from '../../core/engine';
 import { genId } from '../../core/presets';
 import type { Rule, RuleType, Scheme } from '../../core/types';
-import { getSchemes, getSettings, saveSchemes, updateSettings } from '../../storage';
+import { ensureSeeded, getSchemes, getSettings, saveSchemes, updateSettings } from '../../storage';
 import { t } from '../../i18n';
 import Toggle from '../Toggle';
 import RuleCard, { RULE_ROW_COLS } from './RuleCard';
@@ -35,12 +36,14 @@ export default function SchemesTab() {
   schemeNameRef.current = schemeName;
 
   useEffect(() => {
-    void getSchemes().then((list) => {
-      setSchemes(list);
-      const initial = list.find((s) => s.isDefault) ?? list[0];
-      setSelectedId(initial?.id ?? '');
-      setSchemeName(initial?.name ?? '');
-    });
+    void ensureSeeded()
+      .then(() => getSchemes())
+      .then((list) => {
+        setSchemes(list);
+        const initial = list.find((s) => s.isDefault) ?? list[0];
+        setSelectedId(initial?.id ?? '');
+        setSchemeName(initial?.name ?? '');
+      });
   }, []);
 
   const selected = schemes.find((s) => s.id === selectedId);
@@ -426,6 +429,11 @@ export default function SchemesTab() {
                     onToggle={(enabled) =>
                       mutateSelectedRules((rules) =>
                         rules.map((x) => (x.id === rule.id ? { ...x, enabled } : x)),
+                      )
+                    }
+                    onModeChange={(mode) =>
+                      mutateSelectedRules((rules) =>
+                        rules.map((x) => (x.id === rule.id ? applyRuleModeChange(x, mode) : x)),
                       )
                     }
                     onEdit={() => setModal({ mode: 'edit', rule })}

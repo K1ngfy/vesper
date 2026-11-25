@@ -6,15 +6,19 @@
  * 渐进授权：list 模式下未配置/无权限的当前标签页可一键申请该域两条 origin
  * 并加入名单启用，替代「全局权限」诉求，守住 D5 最小权限。
  */
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import type { Scheme, SiteRule, SiteScope } from '@/src/core/types';
+import { hasAvailableUpdate, type UpdateState } from '@/src/core/update';
 import { sendMessage, type SiteStateResponse } from '@/src/messages';
 import {
+  ensureSeeded,
   getSettings,
   updateSettings,
   getSites,
   saveSites,
+  getUpdateState,
   hostToOrigins,
+  UPDATE_STATE_KEY,
   urlToHost,
 } from '@/src/storage';
 import { genId, normalizeHost } from '@/src/core/presets';
@@ -38,24 +42,105 @@ export default function App() {
   const [scope, setScope] = useState<SiteScope>('list');
   const [count, setCount] = useState(0);
   const [busy, setBusy] = useState(false);
+  const [updateState, setUpdateState] = useState<UpdateState | undefined>(undefined);
+  const windowIdRef = useRef<number | undefined>(undefined);
+  const tabIdRef = useRef<number | undefined>(undefined);
+  const bypassNativeSidePanelRef = useRef(false);
+  const hasUpdate = hasAvailableUpdate(chrome.runtime.getManifest().version, updateState);
 
   async function refreshSiteState() {
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+    if (tab?.windowId != null) windowIdRef.current = tab.windowId;
+    if (tab?.id != null) tabIdRef.current = tab.id;
+    if (tab?.url?.startsWith('arc://')) {
+      bypassNativeSidePanelRef.current = true;
+      void chrome.storage.local.set({ 'vesper:isArc': true }).catch(() => {});
+    }
     setActiveHost(urlToHost(tab?.url ?? ''));
     setSiteState(tab?.url ? await sendMessage({ type: 'GET_SITE_STATE', url: tab.url }) : null);
   }
 
   useEffect(() => {
+    const checkOwnArcStyles = () => {
+      try {
+        const s = getComputedStyle(document.documentElement);
+        if (
+          s.getPropertyValue('--arc-palette-title').trim() ||
+          s.getPropertyValue('--arc-palette-background').trim() ||
+          s.getPropertyValue('--arc-background-simple-color').trim()
+        ) {
+          bypassNativeSidePanelRef.current = true;
+          void chrome.storage.local.set({ 'vesper:isArc': true }).catch(() => {});
+        }
+      } catch {
+        // 忽略样式探测异常
+      }
+    };
+    checkOwnArcStyles();
+    const arcStyleTimer = window.setTimeout(checkOwnArcStyles, 200);
+
+    void Promise.all([
+      chrome.storage.local.get('vesper:isArc').catch(() => ({}) as Record<string, unknown>),
+      chrome.storage.session
+        .get('vesper:nativeSidePanelBroken')
+        .catch(() => ({}) as Record<string, unknown>),
+    ]).then(([localObj, sessionObj]) => {
+      if (localObj['vesper:isArc'] || sessionObj['vesper:nativeSidePanelBroken']) {
+        bypassNativeSidePanelRef.current = true;
+      }
+    });
+
+    // 立即预取当前窗口与活动标签 ID，同时借助 activeTab 探测宿主是否为 Arc 浏览器
+    void chrome.windows
+      .getCurrent()
+      .then((win) => {
+        if (win?.id != null) windowIdRef.current = win.id;
+      })
+      .catch(() => {});
+    void chrome.tabs
+      .query({ active: true, currentWindow: true })
+      .then(([tab]) => {
+        if (tab?.windowId != null) windowIdRef.current = tab.windowId;
+        if (tab?.id != null) tabIdRef.current = tab.id;
+        if (tab?.url?.startsWith('arc://')) {
+          bypassNativeSidePanelRef.current = true;
+          void chrome.storage.local.set({ 'vesper:isArc': true }).catch(() => {});
+        } else if (tab?.id != null && /^https?:\/\//.test(tab.url ?? '')) {
+          void chrome.scripting
+            ?.executeScript({
+              target: { tabId: tab.id },
+              func: () => {
+                const s = getComputedStyle(document.documentElement);
+                return Boolean(
+                  s.getPropertyValue('--arc-palette-title').trim() ||
+                  s.getPropertyValue('--arc-palette-background').trim() ||
+                  s.getPropertyValue('--arc-background-simple-color').trim(),
+                );
+              },
+            })
+            .then((res) => {
+              if (res?.[0]?.result === true) {
+                bypassNativeSidePanelRef.current = true;
+                void chrome.storage.local.set({ 'vesper:isArc': true }).catch(() => {});
+              }
+            })
+            .catch(() => {});
+        }
+      })
+      .catch(() => {});
     void (async () => {
-      const [settings, list, c] = await Promise.all([
+      await ensureSeeded();
+      const [settings, list, c, upd] = await Promise.all([
         getSettings(),
         sendMessage({ type: 'GET_SCHEMES' }),
         sendMessage({ type: 'GET_DAILY_COUNT' }),
+        getUpdateState(),
       ]);
       if (settings) {
         setGlobalEnabled(settings.globalEnabled);
         setScope(settings.siteScope ?? 'list');
       }
+      setUpdateState(upd);
       const effectiveScheme =
         list.find((s) => s.id === settings?.activeSchemeId) ??
         list.find((s) => s.isDefault) ??
@@ -65,6 +150,16 @@ export default function App() {
       setCount(c);
       await refreshSiteState();
     })();
+    const onChange = (changes: Record<string, chrome.storage.StorageChange>, area: string) => {
+      if (area === 'local' && UPDATE_STATE_KEY in changes) {
+        setUpdateState(changes[UPDATE_STATE_KEY]?.newValue as UpdateState | undefined);
+      }
+    };
+    chrome.storage.onChanged.addListener(onChange);
+    return () => {
+      window.clearTimeout(arcStyleTimer);
+      chrome.storage.onChanged.removeListener(onChange);
+    };
   }, []);
 
   async function toggleGlobal() {
@@ -121,25 +216,49 @@ export default function App() {
   }
 
   async function openSidePanel() {
-    // 优先用原生 sidePanel（Chrome / Edge 支持）；Arc 等浏览器不支持
-    // chrome.sidePanel API，open() 会抛错——此时降级为独立面板窗口，
-    // 否则错误被 void 静默吞掉，用户看到"点了没反应"。
-    try {
-      if (chrome.sidePanel?.open) {
-        const win = await chrome.windows.getCurrent();
-        await chrome.sidePanel.open({ windowId: win.id! });
-        window.close();
-        return;
-      }
-    } catch {
-      // 落到下方降级方案
+    const windowId = windowIdRef.current;
+    const tabId = tabIdRef.current;
+
+    // 已知为 Arc 或原生侧边栏不可见的浏览器时，零延迟直接拉起贴边独立侧边栏窗口
+    if (bypassNativeSidePanelRef.current || !chrome.sidePanel?.open) {
+      await sendMessage({ type: 'OPEN_SIDE_PANEL_FALLBACK', windowId }).catch(() => {});
+      window.close();
+      return;
     }
-    await chrome.windows.create({
-      url: chrome.runtime.getURL('/sidepanel.html'),
-      type: 'panel',
-      width: 520,
-      height: 760,
-    });
+
+    // 关键约束：chrome.sidePanel.open 必须在点击手势的同步栈帧内直接调用（禁止前置 await）
+    let openTask: Promise<void> | undefined;
+    if (windowId != null || tabId != null) {
+      try {
+        openTask =
+          windowId != null
+            ? chrome.sidePanel.open({ windowId })
+            : chrome.sidePanel.open({ tabId: tabId! });
+      } catch {
+        openTask = undefined;
+      }
+    }
+
+    if (!openTask) {
+      await sendMessage({ type: 'OPEN_SIDE_PANEL_FALLBACK', windowId }).catch(() => {});
+      window.close();
+      return;
+    }
+
+    // 立即通知后台启动真实可见性探活（即便 openTask 在 Arc 中永不 resolve 或创建隐藏幽灵视图也能兜底）
+    void sendMessage({ type: 'VERIFY_SIDE_PANEL_OPENED', windowId }).catch(() => {});
+
+    const outcome = await Promise.race([
+      openTask.then(
+        () => 'resolved' as const,
+        () => 'rejected' as const,
+      ),
+      new Promise<'timeout'>((resolve) => setTimeout(() => resolve('timeout'), 350)),
+    ]);
+
+    if (outcome === 'rejected') {
+      await sendMessage({ type: 'OPEN_SIDE_PANEL_FALLBACK', windowId }).catch(() => {});
+    }
     window.close();
   }
 
@@ -243,10 +362,22 @@ export default function App() {
           {t.popup.openWorkbench}
         </button>
         <button
-          className="rounded-md border border-[var(--vesper-border)] px-2 py-2 hover:border-[var(--vesper-accent)]"
+          className="relative rounded-md border border-[var(--vesper-border)] px-2 py-2 hover:border-[var(--vesper-accent)]"
           onClick={() => void chrome.runtime.openOptionsPage()}
         >
           {t.popup.openOptions}
+          {hasUpdate && (
+            <span
+              data-testid="popup-update-dot"
+              title={
+                updateState?.latestVersion
+                  ? t.options.updateAvailableText(updateState.latestVersion)
+                  : t.options.updateAvailableBadge
+              }
+              aria-label={t.options.updateAvailableBadge}
+              className="absolute top-1.5 right-1.5 h-2 w-2 rounded-full bg-red-500"
+            />
+          )}
         </button>
         <button
           className="rounded-md border border-[var(--vesper-border)] px-2 py-2 hover:border-[var(--vesper-accent)]"

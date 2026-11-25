@@ -160,6 +160,7 @@ export const zhCN = {
     excludeListTip:
       '支持通配符与网段：*.example.com 匹配根域及其所有子域，* 匹配全部；192.168.0.0/16 为 IPv4 网段；IPv6 写成 [::1]',
     excludeEmpty: '每行一个主机，如 127.0.0.1',
+    excludeSaved: '已保存',
     globalModeTitle: '拦截模式',
     globalModeHint: '全局拦截所有站点时，遇到敏感信息的处理方式',
     selectorAdvanced: '高级：自定义输入框定位',
@@ -179,6 +180,16 @@ export const zhCN = {
     persistMappingsRisk:
       '开启后，最近 20 批脱敏的「占位符 ↔ 原文」对照会写入本机存储，关闭浏览器后仍会保留。确认开启？',
     importInvalid: '文件校验失败：',
+    autoCheckUpdate: '自动检查版本更新',
+    autoCheckUpdateDesc:
+      '定期（每 12 小时）通过公开的 GitHub Releases 接口检查是否有新正式版发布，不携带 Cookie 与任何本地文本或规则数据。',
+    checkUpdate: '检查更新',
+    checkingUpdate: '检查中…',
+    updateAvailableBadge: '有可用新版本',
+    updateAvailableText: (v: string) => `发现新版本 v${v}`,
+    downloadUpdate: '前往下载',
+    upToDate: (v: string) => `当前已是最新版本（v${v}）`,
+    checkUpdateFailed: (err: string) => `检查更新失败：${err}`,
     about: '关于',
     githubRepo: '访问 GitHub 仓库',
     privacy: 'VESPER 全程本地处理，不收集、不上传、不传输任何数据。你的规则与文本永不离开浏览器。',

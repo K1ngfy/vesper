@@ -1,3 +1,5 @@
+import { VESPER_SYNTHETIC_PASTE_MIME } from './clipboard-guard';
+
 type Field = HTMLTextAreaElement | HTMLInputElement;
 
 function isField(el: HTMLElement): el is Field {
@@ -63,6 +65,7 @@ function pasteIntoRichEditor(
   const savedRange = selection.rangeCount ? selection.getRangeAt(0).cloneRange() : null;
   const data = new DataTransfer();
   data.setData('text/plain', text);
+  data.setData(VESPER_SYNTHETIC_PASTE_MIME, '1');
   if (includeProseMirrorHtml) {
     // An open ProseMirror slice joins the first and last lines to the surrounding
     // paragraph and preserves empty paragraphs and indentation between them.
